@@ -307,19 +307,27 @@ def answer_question(
     question: str,
     chat_history: Optional[List[Dict[str, str]]] = None,
     top_k: int = 8,
+    retrieval_query: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Answers a natural-language question about one patient, grounded only in
     that patient's already-indexed timeline chunks.
 
-    1. Embeds the question.
+    1. Embeds the retrieval query (see retrieval_query below).
     2. Queries the patient's Chroma collection for the top_k most similar
        chunks.
     3. Builds a prompt from those chunks (each tagged with its date and
-       source_file), plus chat_history and the question.
+       source_file), plus chat_history and the (display) question.
     4. Calls the chat model with a system prompt that forbids diagnosis,
        requires deferring to a professional for risk/interaction/dosage
        questions, and forces structured JSON output.
+
+    retrieval_query: optional string used for embedding/Chroma retrieval
+        instead of `question`. Lets a caller (e.g. conversation.py) rewrite
+        an ambiguous follow-up like "was that safe?" into a fully-specified
+        search query, while `question` remains the literal text shown to
+        the answering LLM as "the question asked". Defaults to `question`
+        when omitted, so existing single-shot callers are unaffected.
 
     Returns the parsed JSON:
         {"answer": str, "confidence": float, "sources": [{"date", "source_file"}],
@@ -335,11 +343,15 @@ def answer_question(
     if not question or not question.strip():
         raise ValueError("question is required and cannot be empty.")
 
+    effective_retrieval_query = (
+        retrieval_query if retrieval_query and retrieval_query.strip() else question
+    )
+
     collection = _get_patient_collection(patient_key, create=False)
     if collection is None or collection.count() == 0:
         return dict(_NO_INFO_ANSWER)
 
-    query_embedding = embed_texts([question])[0]
+    query_embedding = embed_texts([effective_retrieval_query])[0]
 
     results = collection.query(
         query_embeddings=[query_embedding],

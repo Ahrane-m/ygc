@@ -15,15 +15,19 @@ Env:
 
 import os
 import io
+import re
 import json
 import base64
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import pdfplumber
 import fitz  # PyMuPDF, used to rasterize scanned PDFs
 from PIL import Image
 from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
@@ -524,12 +528,83 @@ def cross_check_prescriptions(timeline: Dict[str, Any], model: str = MODEL) -> D
 
 
 # ---------------------------------------------------------------------------
-# 7. Example usage — full pipeline: extract -> merge -> cross-check
+# 7. Persistence helpers — patient report / raw-document cache on disk
+# ---------------------------------------------------------------------------
+# Shared by the CLI (__main__ below) and the HTTP API (api.py), so a patient
+# processed via either entry point is visible to the other. Two files per
+# patient:
+#   patient_docs_<name>.json   - raw extracted per-document dicts (flattened,
+#                                pre-timeline), so a later API upload can
+#                                merge new documents in rather than
+#                                replacing the patient's whole history.
+#   patient_report_<name>.json - the merged {"patient_key", "patient_timeline",
+#                                "cross_check_report"} snapshot, same shape
+#                                the CLI has always written.
+
+def _safe_patient_filename(patient_key: str) -> str:
+    """Maps a patient_key into a filesystem-safe name for the two files
+    above. Same sanitization the CLI used to do inline."""
+    return re.sub(r"[^a-z0-9_]+", "_", patient_key.lower()).strip("_") or "patient"
+
+
+def _patient_docs_path(patient_key: str) -> str:
+    return f"patient_docs_{_safe_patient_filename(patient_key)}.json"
+
+
+def _patient_report_path(patient_key: str) -> str:
+    return f"patient_report_{_safe_patient_filename(patient_key)}.json"
+
+
+def load_patient_documents(patient_key: str) -> List[Dict[str, Any]]:
+    """Loads the raw extracted documents previously saved for this patient
+    via save_patient_documents(). Returns [] if this patient has never been
+    processed before (nothing to merge new uploads into)."""
+    path = _patient_docs_path(patient_key)
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return json.load(f)
+
+
+def save_patient_documents(patient_key: str, docs: List[Dict[str, Any]]) -> None:
+    """Persists the full raw extracted-document list for a patient (flat,
+    already run through _flatten_documents) so a future upload can extend
+    it instead of overwriting this patient's document history."""
+    with open(_patient_docs_path(patient_key), "w") as f:
+        json.dump(docs, f, indent=2)
+
+
+def load_patient_report(patient_key: str) -> Optional[Dict[str, Any]]:
+    """Loads the {"patient_key", "patient_timeline", "cross_check_report"}
+    snapshot previously written for this patient, or None if this patient
+    hasn't been processed yet."""
+    path = _patient_report_path(patient_key)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def save_patient_report(
+    patient_key: str, timeline: Dict[str, Any], cross_check: Dict[str, Any]
+) -> None:
+    """Writes the merged timeline + cross-check report to disk — same shape
+    and naming convention the CLI __main__ flow has always used."""
+    output = {
+        "patient_key": patient_key,
+        "patient_timeline": timeline,
+        "cross_check_report": cross_check,
+    }
+    with open(_patient_report_path(patient_key), "w") as f:
+        json.dump(output, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# 8. Example usage — full pipeline: extract -> merge -> cross-check
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import sys
-    import re
 
     if len(sys.argv) < 2:
         print("Usage:")
@@ -540,7 +615,7 @@ if __name__ == "__main__":
 
     # Imported here (not at module top) so retrieval.py's `from
     # medical_extractor import client, MODEL` doesn't create a circular import.
-    from retrieval import index_patient_timeline, answer_question
+    from retrieval import index_patient_timeline
 
     args = sys.argv[1:]
     chat_mode = "--chat" in args
@@ -598,16 +673,11 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"  Indexing failed (Q&A won't be available for this patient): {e}")
 
-        output = {
-            "patient_key": patient_key,
-            "patient_timeline": timeline,
-            "cross_check_report": cross_check,
-        }
-
-        safe_name = re.sub(r"[^a-z0-9_]+", "_", patient_key.lower()).strip("_") or "patient"
-        out_path = f"patient_report_{safe_name}.json"
-        with open(out_path, "w") as f:
-            json.dump(output, f, indent=2)
+        # Persist raw docs too (not just the merged report) so a later API
+        # upload for this same patient can merge new documents in.
+        save_patient_documents(patient_key, docs)
+        save_patient_report(patient_key, timeline, cross_check)
+        out_path = _patient_report_path(patient_key)
 
         print(f"Saved report to {out_path}")
         print(f"  Documents in timeline: {len(timeline['visits'])}")
@@ -632,8 +702,10 @@ if __name__ == "__main__":
                 print("Invalid selection. Exiting.")
                 sys.exit(1)
 
+        from conversation import get_or_create_session, ask as conversation_ask
+
         print(f"\nChatting about patient '{active_patient}'. Type 'exit' to quit.")
-        chat_history = []
+        session = get_or_create_session(active_patient, session_id="cli")
         while True:
             question = input("\nQuestion: ").strip()
             if question.lower() in ("exit", "quit"):
@@ -641,10 +713,9 @@ if __name__ == "__main__":
             if not question:
                 continue
             try:
-                result = answer_question(active_patient, question, chat_history=chat_history)
+                result = conversation_ask(session, question)
             except Exception as e:
                 print(f"  Error: {e}")
                 continue
+            print(f"  [retrieval query]: {result.get('rewritten_query')}")
             print(json.dumps(result, indent=2))
-            chat_history.append({"role": "user", "content": question})
-            chat_history.append({"role": "assistant", "content": result.get("answer", "")})
