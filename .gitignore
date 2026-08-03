@@ -7,5 +7,3 @@ chroma_db/
 # generated per-patient reports (contain patient data)
 patient_report_*.json
 patient_docs_*.json
-
-.env
