@@ -535,9 +535,16 @@ if __name__ == "__main__":
         print("Usage:")
         print("  Single/multiple files:  python medical_extractor.py file1.pdf file2.jpg ...")
         print("  Whole patient folder:   python medical_extractor.py \"C:\\path\\to\\Patient x\"")
+        print("  Then chat about it:     add --chat to either form above")
         sys.exit(1)
 
+    # Imported here (not at module top) so retrieval.py's `from
+    # medical_extractor import client, MODEL` doesn't create a circular import.
+    from retrieval import index_patient_timeline, answer_question
+
     args = sys.argv[1:]
+    chat_mode = "--chat" in args
+    args = [a for a in args if a != "--chat"]
 
     for a in args:
         if ".zip" in a.lower():
@@ -585,6 +592,12 @@ if __name__ == "__main__":
         print("Cross-checking prescriptions ...")
         cross_check = cross_check_prescriptions(timeline)
 
+        print("Indexing timeline for retrieval (Q&A) ...")
+        try:
+            index_patient_timeline(patient_key, timeline)
+        except Exception as e:
+            print(f"  Indexing failed (Q&A won't be available for this patient): {e}")
+
         output = {
             "patient_key": patient_key,
             "patient_timeline": timeline,
@@ -602,3 +615,36 @@ if __name__ == "__main__":
         print(f"  Interaction flags: {len(cross_check.get('potential_drug_interactions', []))}")
         print(f"  Duplicate flags: {len(cross_check.get('duplicate_prescriptions', []))}")
         print(f"  Dosage conflict flags: {len(cross_check.get('conflicting_dosage_instructions', []))}")
+
+    # Step 5 (optional): interactive Q&A over whatever was just indexed.
+    if chat_mode:
+        patient_keys = list(patient_groups.keys())
+        if len(patient_keys) == 1:
+            active_patient = patient_keys[0]
+        else:
+            print("\nMultiple patients were processed:")
+            for i, k in enumerate(patient_keys):
+                print(f"  [{i}] {k}")
+            choice = input("Select a patient index to chat about: ").strip()
+            try:
+                active_patient = patient_keys[int(choice)]
+            except (ValueError, IndexError):
+                print("Invalid selection. Exiting.")
+                sys.exit(1)
+
+        print(f"\nChatting about patient '{active_patient}'. Type 'exit' to quit.")
+        chat_history = []
+        while True:
+            question = input("\nQuestion: ").strip()
+            if question.lower() in ("exit", "quit"):
+                break
+            if not question:
+                continue
+            try:
+                result = answer_question(active_patient, question, chat_history=chat_history)
+            except Exception as e:
+                print(f"  Error: {e}")
+                continue
+            print(json.dumps(result, indent=2))
+            chat_history.append({"role": "user", "content": question})
+            chat_history.append({"role": "assistant", "content": result.get("answer", "")})
