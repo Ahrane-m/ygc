@@ -41,7 +41,8 @@ OPENAI_API_KEY=sk-...
 ## Running the API
 
 ```
-uvicorn api:app --reload
+python -m uvicorn api:app --reload
+
 ```
 
 - Base URL: `http://127.0.0.1:8000`

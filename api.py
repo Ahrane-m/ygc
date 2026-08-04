@@ -18,6 +18,7 @@ Env:
     export OPENAI_API_KEY="sk-..."   (same key the rest of the pipeline uses)
 """
 
+import logging
 import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -38,6 +39,9 @@ from medical_extractor import (
     save_patient_report,
 )
 from retrieval import answer_question, index_patient_timeline
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("api")
 
 SUPPORTED_EXTENSIONS = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
 
@@ -75,7 +79,9 @@ async def upload_documents(patient_key: str, files: List[UploadFile] = File(...)
     for a single batch, but accumulating across calls.
     """
     patient_key = _normalize_patient_key(patient_key)
+    logger.info("upload_documents: patient=%s received %d file(s)", patient_key, len(files))
     if not files:
+        logger.warning("upload_documents: patient=%s no files in request", patient_key)
         raise HTTPException(400, "No files were uploaded.")
 
     new_docs = []
@@ -83,35 +89,70 @@ async def upload_documents(patient_key: str, files: List[UploadFile] = File(...)
         for upload in files:
             suffix = Path(upload.filename or "").suffix.lower()
             if suffix not in SUPPORTED_EXTENSIONS:
+                logger.warning(
+                    "upload_documents: patient=%s rejected '%s' (unsupported type '%s')",
+                    patient_key, upload.filename, suffix or "(none)",
+                )
                 raise HTTPException(
                     400,
                     f"Unsupported file type '{suffix or '(no extension)'}' for "
                     f"'{upload.filename}'. Supported: {', '.join(SUPPORTED_EXTENSIONS)}",
                 )
             tmp_path = Path(tmp_dir) / upload.filename
-            tmp_path.write_bytes(await upload.read())
+            content = await upload.read()
+            tmp_path.write_bytes(content)
+            logger.info(
+                "upload_documents: patient=%s processing '%s' (%d bytes)",
+                patient_key, upload.filename, len(content),
+            )
             try:
                 result = process_document(str(tmp_path))
             except Exception as e:
+                logger.error(
+                    "upload_documents: patient=%s extraction failed for '%s': %s",
+                    patient_key, upload.filename, e, exc_info=True,
+                )
                 raise HTTPException(422, f"Extraction failed for '{upload.filename}': {e}")
 
             if isinstance(result, dict) and result.get("multi_page"):
+                logger.info(
+                    "upload_documents: patient=%s '%s' extracted as %d page(s)",
+                    patient_key, upload.filename, len(result["pages"]),
+                )
                 new_docs.extend(result["pages"])
             else:
                 new_docs.append(result)
 
     all_docs = load_patient_documents(patient_key) + new_docs
+    logger.info(
+        "upload_documents: patient=%s merged documents: +%d new, %d total",
+        patient_key, len(new_docs), len(all_docs),
+    )
+
     timeline = build_patient_timeline(all_docs)
     cross_check = cross_check_prescriptions(timeline)
+    issue_count = sum(len(v) for v in cross_check.values() if isinstance(v, list))
+    logger.info(
+        "upload_documents: patient=%s timeline rebuilt, cross-check found %d issue(s)",
+        patient_key, issue_count,
+    )
 
     indexed, index_error = True, None
     try:
         index_patient_timeline(patient_key, timeline)
+        logger.info("upload_documents: patient=%s re-indexed for Q&A", patient_key)
     except Exception as e:
         indexed, index_error = False, str(e)
+        logger.error(
+            "upload_documents: patient=%s indexing failed: %s", patient_key, e, exc_info=True,
+        )
 
     save_patient_documents(patient_key, all_docs)
     save_patient_report(patient_key, timeline, cross_check)
+    logger.info(
+        "upload_documents: patient=%s request complete: documents_added=%d documents_total=%d indexed=%s",
+        patient_key, len(new_docs), len(all_docs), indexed,
+    )
 
     response = {
         "patient_key": patient_key,
