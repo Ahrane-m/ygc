@@ -19,7 +19,7 @@ import re
 import json
 import base64
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import pdfplumber
 import fitz  # PyMuPDF, used to rasterize scanned PDFs
@@ -47,6 +47,56 @@ always attempt to identify the active ingredient(s) using your medical
 knowledge, even if the document only prints a brand name (e.g. brand
 "Panadol" -> ingredients ["Paracetamol"]). Use an empty array only if the
 ingredient is genuinely unknown/undeterminable.
+
+CONFIDENCE SCORING — anchor every confidence value to these bands. Do not
+default to a high score; think about which band actually applies before
+writing a number:
+- 0.90-1.00: text is clearly printed/typed and the field maps to the schema
+  with no judgment required.
+- 0.60-0.89: text is legible but you had to exercise judgment — expanding an
+  abbreviation, reading a partially cut-off table cell, or inferring an
+  active ingredient from a brand name that was NOT itself printed on the
+  document.
+- Below 0.60: handwriting is genuinely hard to read, the text is blurry or
+  cut off, or you are inferring a value rather than reading one directly off
+  the page.
+A medication's active ingredient being inferred (not printed) rather than
+read directly is, by itself, enough to keep that medication's confidence
+below 0.90 — brand-to-generic mapping is your knowledge substituting for
+what the document actually says, not a transcription.
+
+LANGUAGE AND UNIT NORMALIZATION — documents may be in any language, and a
+patient's timeline may combine documents from several languages. Two
+prescriptions for the same drug at the same dose must be recognizable as
+the same regardless of what language or units each was printed in:
+- ingredients must always be the English INN (International Nonproprietary
+  Name) / generic drug name, regardless of the document's language (e.g.
+  "Amoxicilina" (Spanish) or "アモキシシリン" (Japanese) -> ingredients:
+  ["Amoxicillin"]).
+- dosage and frequency stay exactly as printed, in the original language —
+  these are for human/audit display, so a reviewer can see literally what
+  the document said.
+- dosage_value / dosage_unit are your best-effort NORMALIZED numeric dose,
+  independent of source language: "500 mg" -> dosage_value=500,
+  dosage_unit="mg"; "0.5 g" -> dosage_value=500, dosage_unit="mg" (convert
+  mass units to mg so entries become directly comparable); "5 mL" ->
+  dosage_value=5, dosage_unit="mL" (do not convert volume/count/unit-based
+  dosing). Use null for both if the dose can't be reduced to one
+  value+unit (e.g. a titration schedule).
+- frequency_per_day is your best-effort NORMALIZED doses-per-day count,
+  independent of source language or phrasing — "cada 8 horas" (Spanish),
+  "3 fois par jour" (French), and "3x daily" (English) must all normalize
+  to frequency_per_day=3. Set is_as_needed=true (and frequency_per_day=
+  null) for PRN/as-needed dosing with no fixed daily count. Set
+  is_as_needed=false and frequency_per_day=null only if genuinely
+  indeterminate.
+- Watch for locale-specific number formatting: some locales use a comma as
+  the decimal separator (e.g. "1,5 g" means 1.5 grams, not 15 grams).
+  Misreading this is a real dosing error, not a cosmetic one.
+- Translating an ingredient name, converting a unit, or resolving a
+  frequency phrase is itself inference, not transcription — factor that
+  into the medication's confidence the same way an inferred brand-to-
+  generic mapping is.
 
 Rules:
 - If handwriting is unclear, make your best guess but LOWER the confidence
@@ -77,9 +127,17 @@ EXTRACTION_JSON_SCHEMA = {
                     "dosage": {"type": "string"},
                     "frequency": {"type": "string"},
                     "duration": {"type": ["string", "null"]},
+                    "dosage_value": {"type": ["number", "null"]},
+                    "dosage_unit": {"type": ["string", "null"]},
+                    "frequency_per_day": {"type": ["number", "null"]},
+                    "is_as_needed": {"type": "boolean"},
                     "confidence": {"type": "number"},
                 },
-                "required": ["name", "ingredients", "dosage", "frequency", "duration", "confidence"],
+                "required": [
+                    "name", "ingredients", "dosage", "frequency", "duration",
+                    "dosage_value", "dosage_unit", "frequency_per_day", "is_as_needed",
+                    "confidence",
+                ],
                 "additionalProperties": False,
             },
         },
@@ -219,6 +277,29 @@ def extract_from_text(text: str, model: str = MODEL) -> Dict[str, Any]:
     return json.loads(response.choices[0].message.content)
 
 
+VISION_OCR_CONFIDENCE_CEILING = 0.85  # a vision/handwriting read is never "fully certain"
+
+
+def _apply_confidence_ceiling(result: Dict[str, Any], ceiling: float) -> Dict[str, Any]:
+    """
+    Caps every confidence value in an extraction result at `ceiling`. Used
+    for vision_ocr-sourced documents (scanned PDFs, photographed
+    prescriptions) so a model's self-reported 0.95 on a handwriting read
+    can't outrank what the extraction method itself can actually support.
+    Text-layer (text_layer) extractions are left uncapped since those come
+    from a digital text source, not a visual read.
+    """
+    if "overall_confidence" in result and isinstance(result["overall_confidence"], (int, float)):
+        result["overall_confidence"] = min(result["overall_confidence"], ceiling)
+    for med in result.get("medications", []) or []:
+        if isinstance(med.get("confidence"), (int, float)):
+            med["confidence"] = min(med["confidence"], ceiling)
+    for lab in result.get("lab_results", []) or []:
+        if isinstance(lab.get("confidence"), (int, float)):
+            lab["confidence"] = min(lab["confidence"], ceiling)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 4. Top-level entry point — routes any uploaded file correctly
 # ---------------------------------------------------------------------------
@@ -274,6 +355,7 @@ def process_document(file_path: str, model: str = MODEL) -> Dict[str, Any]:
             page_results = []
             for i, img in enumerate(pages):
                 res = extract_from_image(img, model=model)
+                res = _apply_confidence_ceiling(res, VISION_OCR_CONFIDENCE_CEILING)
                 res["_source"] = {
                     "file": path.name,
                     "method": "vision_ocr",
@@ -285,6 +367,7 @@ def process_document(file_path: str, model: str = MODEL) -> Dict[str, Any]:
     else:  # image types
         img = Image.open(file_path)
         result = extract_from_image(img, model=model)
+        result = _apply_confidence_ceiling(result, VISION_OCR_CONFIDENCE_CEILING)
         result["_source"] = {"file": path.name, "method": "vision_ocr"}
         return result
 
@@ -491,22 +574,201 @@ this shape:
   "overall_recommendation": "1-2 sentence plain-language summary that ALWAYS recommends the patient consult a doctor or pharmacist before making any changes. Never present this as a diagnosis."
 }
 
+CONFIDENCE SCORING — anchor every confidence value to these bands. Do not
+default to a high score:
+- 0.90-1.00: the interaction/conflict/duplicate is well-established,
+  unambiguous clinical knowledge (e.g. a textbook contraindicated pairing,
+  an exact-ingredient duplicate).
+- 0.60-0.89: plausible and worth surfacing, but depends on dose, timing, or
+  patient-specific factors you cannot verify from this data alone.
+- Below 0.60: a weak or speculative signal — include it only if omitting it
+  would be the more dangerous error, and mark it clearly as low-confidence.
+
 Rules:
 - Compare medications by their active ingredients (not just brand names) —
   two different brand names with the same active ingredient is a likely
   duplicate.
+- Medications are the SAME regardless of source language or printed
+  wording — compare using ingredients (already normalized to English
+  generic names), dosage_value + dosage_unit, and frequency_per_day
+  (already normalized numeric fields), NOT the original dosage/frequency
+  text. Do not flag something as a conflict or a difference if it is only
+  a translation or unit-formatting difference — e.g. "500 mg" and "0.5 g"
+  that both normalized to dosage_value=500/dosage_unit="mg" are the SAME
+  dose, not a conflict. Only flag genuine differences in the normalized
+  values.
 - Only flag interactions you have reasonable clinical confidence about;
   lower the confidence score rather than omitting a plausible risk.
 - Do not diagnose. Do not tell the patient to stop or start any medication.
   Always defer to a licensed professional.
+- You are a reasoning layer over extracted text, NOT a validated clinical
+  drug-interaction database. overall_recommendation must state plainly that
+  this analysis is not a substitute for a pharmacist or a licensed
+  drug-interaction checking tool, in addition to recommending consultation.
 """
+
+
+CROSS_CHECK_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "potential_drug_interactions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "medications_involved": {"type": "array", "items": {"type": "string"}},
+                    "explanation": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["low", "moderate", "high"]},
+                    "confidence": {"type": "number"},
+                },
+                "required": ["medications_involved", "explanation", "severity", "confidence"],
+                "additionalProperties": False,
+            },
+        },
+        "duplicate_prescriptions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "medication": {"type": "string"},
+                    "occurrences": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "date": {"type": ["string", "null"]},
+                                "source_file": {"type": ["string", "null"]},
+                                "dosage": {"type": ["string", "null"]},
+                            },
+                            "required": ["date", "source_file", "dosage"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "explanation": {"type": "string"},
+                    "confidence": {"type": "number"},
+                },
+                "required": ["medication", "occurrences", "explanation", "confidence"],
+                "additionalProperties": False,
+            },
+        },
+        "conflicting_dosage_instructions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "medication": {"type": "string"},
+                    "conflicting_instructions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "date": {"type": ["string", "null"]},
+                                "source_file": {"type": ["string", "null"]},
+                                "dosage": {"type": ["string", "null"]},
+                                "frequency": {"type": ["string", "null"]},
+                            },
+                            "required": ["date", "source_file", "dosage", "frequency"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "explanation": {"type": "string"},
+                    "confidence": {"type": "number"},
+                },
+                "required": ["medication", "conflicting_instructions", "explanation", "confidence"],
+                "additionalProperties": False,
+            },
+        },
+        "allergy_conflicts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "medication": {"type": "string"},
+                    "allergy": {"type": "string"},
+                    "explanation": {"type": "string"},
+                    "confidence": {"type": "number"},
+                },
+                "required": ["medication", "allergy", "explanation", "confidence"],
+                "additionalProperties": False,
+            },
+        },
+        "overall_recommendation": {"type": "string"},
+    },
+    "required": [
+        "potential_drug_interactions", "duplicate_prescriptions",
+        "conflicting_dosage_instructions", "allergy_conflicts",
+        "overall_recommendation",
+    ],
+    "additionalProperties": False,
+}
+
+CROSS_CHECK_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "medical_cross_check",
+        "strict": True,
+        "schema": CROSS_CHECK_JSON_SCHEMA,
+    },
+}
+
+
+def detect_exact_duplicate_medications(timeline: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Deterministic (non-LLM) duplicate detection using the normalized
+    ingredients + dosage_value + dosage_unit fields set during extraction.
+
+    Why this exists alongside the LLM cross-check: the LLM pass is
+    instructed to compare medications via normalized fields rather than
+    raw printed text, but it's still a probabilistic reasoning step run
+    once per patient. An exact match on ingredient set + numeric dose,
+    across two different source documents, is something code can determine
+    for certain — independent of what language either document was
+    written in — and shouldn't depend on the model reliably catching it
+    every single time. This function only flags matches it can verify
+    exactly; anything looser (different doses that might still interact,
+    brand-name-only duplicates with no normalized dose available) is left
+    to the LLM pass, which remains the primary check.
+    """
+    groups: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    for med in timeline.get("medications_timeline", []):
+        ingredients = tuple(sorted(med.get("ingredients") or []))
+        dosage_value = med.get("dosage_value")
+        dosage_unit = med.get("dosage_unit")
+        if not ingredients or dosage_value is None or not dosage_unit:
+            continue  # nothing normalized to compare — leave this one to the LLM pass
+        key = (ingredients, dosage_value, dosage_unit)
+        groups.setdefault(key, []).append(med)
+
+    duplicates: List[Dict[str, Any]] = []
+    for (ingredients, dosage_value, dosage_unit), meds in groups.items():
+        distinct_sources = {(m.get("date"), m.get("source_file")) for m in meds}
+        if len(distinct_sources) < 2:
+            continue  # same medication appearing once is not a duplicate
+        duplicates.append({
+            "medication": " / ".join(ingredients),
+            "occurrences": [
+                {"date": m.get("date"), "source_file": m.get("source_file"), "dosage": m.get("dosage")}
+                for m in meds
+            ],
+            "explanation": (
+                f"Deterministic check: identical active ingredient(s) ({', '.join(ingredients)}) "
+                f"at the same normalized dose ({dosage_value} {dosage_unit}) appear in "
+                f"{len(distinct_sources)} separate documents, regardless of source language or "
+                "printed wording."
+            ),
+            "confidence": 0.95,  # exact numeric/ingredient match, not model inference
+        })
+    return duplicates
 
 
 def cross_check_prescriptions(timeline: Dict[str, Any], model: str = MODEL) -> Dict[str, Any]:
     """
     Runs interaction / duplicate / dosage-conflict / allergy cross-checking
     over a patient's merged medication timeline (output of
-    build_patient_timeline).
+    build_patient_timeline). Merges in a deterministic, language-
+    independent duplicate check (see detect_exact_duplicate_medications)
+    alongside the LLM's own duplicate detection, rather than relying on
+    the LLM pass alone to catch exact cross-language matches.
     """
     payload = {
         "medications_timeline": timeline["medications_timeline"],
@@ -522,9 +784,22 @@ def cross_check_prescriptions(timeline: Dict[str, Any], model: str = MODEL) -> D
                 "content": f"Patient medication data:\n\n{json.dumps(payload, indent=2)}",
             },
         ],
-        response_format={"type": "json_object"},
+        response_format=CROSS_CHECK_RESPONSE_FORMAT,
     )
-    return json.loads(response.choices[0].message.content)
+    result = json.loads(response.choices[0].message.content)
+
+    deterministic_duplicates = detect_exact_duplicate_medications(timeline)
+    existing = result.setdefault("duplicate_prescriptions", [])
+    existing_source_sets = [
+        frozenset((occ.get("date"), occ.get("source_file")) for occ in d.get("occurrences", []))
+        for d in existing
+    ]
+    for dup in deterministic_duplicates:
+        dup_sources = frozenset((occ["date"], occ["source_file"]) for occ in dup["occurrences"])
+        if dup_sources not in existing_source_sets:
+            existing.append(dup)
+
+    return result
 
 
 # ---------------------------------------------------------------------------

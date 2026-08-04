@@ -52,11 +52,24 @@ def _chunk_id(patient_key: str, source_file: Optional[str], chunk_type: str, ind
 def _medication_chunk_text(med: Dict[str, Any]) -> str:
     ingredients = ", ".join(med.get("ingredients") or []) or "unknown"
     duration = med.get("duration") or "not specified"
+
+    dosage_value, dosage_unit = med.get("dosage_value"), med.get("dosage_unit")
+    normalized_dose = f"{dosage_value} {dosage_unit}" if dosage_value is not None and dosage_unit else "not normalized"
+
+    if med.get("is_as_needed"):
+        normalized_freq = "as needed (PRN)"
+    elif med.get("frequency_per_day") is not None:
+        normalized_freq = f"{med['frequency_per_day']} time(s) per day"
+    else:
+        normalized_freq = "not normalized"
+
     return (
         f"Medication: {med.get('name', 'unknown')}. "
-        f"Active ingredient(s): {ingredients}. "
-        f"Dosage: {med.get('dosage', 'unknown')}. "
-        f"Frequency: {med.get('frequency', 'unknown')}. "
+        f"Active ingredient(s) (normalized): {ingredients}. "
+        f"Dosage as printed: {med.get('dosage', 'unknown')} "
+        f"(normalized: {normalized_dose}). "
+        f"Frequency as printed: {med.get('frequency', 'unknown')} "
+        f"(normalized: {normalized_freq}). "
         f"Duration: {duration}. "
         f"Prescribed on {med.get('date') or 'an unknown date'} "
         f"(source: {med.get('source_file') or 'unknown file'})."
@@ -260,6 +273,14 @@ Rules:
   recommend_professional_consult to true.
 - Cite the date and source_file of every chunk you rely on in "sources".
 - Respond with STRICT JSON only, matching the required schema.
+
+CONFIDENCE SCORING — "confidence" reflects how directly the retrieved
+context answers the question, not how fluent your answer sounds:
+- 0.90-1.00: the retrieved chunks state the answer directly and completely.
+- 0.60-0.89: the retrieved chunks are relevant but partial, or you combined
+  more than one chunk to form the answer.
+- Below 0.60: the retrieved chunks are only tangentially related, or you
+  are largely saying "I don't have enough information."
 """
 
 ANSWER_JSON_SCHEMA = {
