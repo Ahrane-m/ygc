@@ -28,6 +28,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 import conversation
+from document_filter import NonMedicalDocumentError, assert_medical_document
 from medical_extractor import (
     _normalize_patient_key,
     build_patient_timeline,
@@ -119,9 +120,27 @@ async def upload_documents(patient_key: str, files: List[UploadFile] = File(...)
                     "upload_documents: patient=%s '%s' extracted as %d page(s)",
                     patient_key, upload.filename, len(result["pages"]),
                 )
-                new_docs.extend(result["pages"])
+                pages = result["pages"]
             else:
-                new_docs.append(result)
+                pages = [result]
+
+            # Reject non-medical files here, right after extraction and
+            # before any of the expensive downstream work (timeline
+            # rebuild, cross-check LLM call, re-indexing). No extra model
+            # call is made — this reuses the document_type/medications/
+            # lab_results/etc. already produced by process_document().
+            for page_num, page in enumerate(pages, start=1):
+                label = upload.filename if len(pages) == 1 else f"{upload.filename} (page {page_num})"
+                try:
+                    assert_medical_document(page, label)
+                except NonMedicalDocumentError as e:
+                    logger.warning(
+                        "upload_documents: patient=%s rejected '%s': %s",
+                        patient_key, label, e.reason,
+                    )
+                    raise HTTPException(422, str(e))
+
+            new_docs.extend(pages)
 
     all_docs = load_patient_documents(patient_key) + new_docs
     logger.info(

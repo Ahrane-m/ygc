@@ -19,6 +19,7 @@ documents --extract--> timeline --cross-check--> safety report
 | Module | Responsibility |
 |---|---|
 | [`medical_extractor.py`](medical_extractor.py) | Extraction, timeline building, cross-checking, on-disk persistence |
+| [`document_filter.py`](document_filter.py) | Rejects non-medical uploads (post-extraction, no extra API call) |
 | [`retrieval.py`](retrieval.py) | Embedding + Chroma indexing, single-shot Q&A (Phase 1) |
 | [`conversation.py`](conversation.py) | Multi-turn sessions, query rewriting, safety-aware summarization (Phase 2) |
 | [`api.py`](api.py) | HTTP API over all of the above (Phase 3) |
@@ -157,7 +158,24 @@ If indexing fails (e.g. embeddings API error), `indexed: false` and an
 still returned and saved.
 
 Errors: `400` no files / unsupported extension, `422` extraction failed for
-a given file.
+a given file, `422` a file extracted successfully but doesn't look like a
+medical document (see below).
+
+**Non-medical document rejection** — passing the `.pdf`/`.png`/`.jpg` file
+extension check doesn't mean a file *is* a medical document (a boarding
+pass or a receipt still uploads fine as an image). After extraction,
+[`document_filter.py`](document_filter.py) checks the result's
+`document_type` and clinical content (medications / lab results /
+allergies / notes) and rejects it with `422` before any timeline/cross-check/
+indexing work happens — no second model call, it just re-uses the
+extraction that already ran:
+
+```json
+{"detail": "'boarding_pass.jpg' does not appear to be a medical document: classified as 'other' with no medications, lab results, allergies, or clinical notes found (overall_confidence=0.4)."}
+```
+
+For multi-page PDFs, each page is checked individually and the page number
+is included in the error (`'file.pdf (page 2)'`).
 
 #### `GET /api/v1/patients/{patient_key}/timeline`
 
