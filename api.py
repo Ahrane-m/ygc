@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 
 import conversation
 from document_filter import NonMedicalDocumentError, assert_medical_document
+from lab_trends import track_lab_trends
 from medical_extractor import (
     _normalize_patient_key,
     build_patient_timeline,
@@ -156,6 +157,12 @@ async def upload_documents(patient_key: str, files: List[UploadFile] = File(...)
         patient_key, issue_count,
     )
 
+    lab_trends = track_lab_trends(timeline)
+    logger.info(
+        "upload_documents: patient=%s lab trend tracking found %d trend(s), %d test(s) with insufficient data",
+        patient_key, len(lab_trends["trends"]), len(lab_trends["insufficient_data"]),
+    )
+
     indexed, index_error = True, None
     try:
         index_patient_timeline(patient_key, timeline)
@@ -167,7 +174,7 @@ async def upload_documents(patient_key: str, files: List[UploadFile] = File(...)
         )
 
     save_patient_documents(patient_key, all_docs)
-    save_patient_report(patient_key, timeline, cross_check)
+    save_patient_report(patient_key, timeline, cross_check, lab_trends=lab_trends)
     logger.info(
         "upload_documents: patient=%s request complete: documents_added=%d documents_total=%d indexed=%s",
         patient_key, len(new_docs), len(all_docs), indexed,
@@ -179,6 +186,7 @@ async def upload_documents(patient_key: str, files: List[UploadFile] = File(...)
         "documents_total": len(all_docs),
         "timeline": timeline,
         "cross_check_report": cross_check,
+        "lab_trends": lab_trends,
         "indexed": indexed,
     }
     if not indexed:
@@ -206,6 +214,21 @@ async def get_cross_check(patient_key: str) -> Dict[str, Any]:
     if report is None:
         raise HTTPException(404, f"No cross-check report found for patient '{patient_key}'.")
     return report["cross_check_report"]
+
+
+@app.get("/api/v1/patients/{patient_key}/lab-trends")
+async def get_lab_trends(patient_key: str) -> Dict[str, Any]:
+    """Returns the patient's lab result trends (direction of drift per
+    test, reference-range crossings, plain-language explanations) computed
+    from the most recent upload/processing run. Recomputed on the fly from
+    the saved timeline for reports saved before this field existed."""
+    patient_key = _normalize_patient_key(patient_key)
+    report = load_patient_report(patient_key)
+    if report is None:
+        raise HTTPException(404, f"No timeline found for patient '{patient_key}'.")
+    if "lab_trends" in report:
+        return report["lab_trends"]
+    return track_lab_trends(report["patient_timeline"])
 
 
 # ---------------------------------------------------------------------------

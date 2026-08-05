@@ -8,6 +8,8 @@ under `/api/v1/`.
 
 ```
 documents --extract--> timeline --cross-check--> safety report
+                |                 |
+                |                 +--trend-track--> lab result trends
                 |                                        |
                 +-----------------> index (Chroma) <-----+
                                         |
@@ -20,17 +22,19 @@ documents --extract--> timeline --cross-check--> safety report
 |---|---|
 | [`medical_extractor.py`](medical_extractor.py) | Extraction, timeline building, cross-checking, on-disk persistence |
 | [`document_filter.py`](document_filter.py) | Rejects non-medical uploads (post-extraction, no extra API call) |
+| [`lab_trends.py`](lab_trends.py) | Tracks each lab test across visits — direction of drift, reference-range crossings, plain-language explanation (deterministic, no LLM call) |
 | [`retrieval.py`](retrieval.py) | Embedding + Chroma indexing, single-shot Q&A (Phase 1) |
 | [`conversation.py`](conversation.py) | Multi-turn sessions, query rewriting, safety-aware summarization (Phase 2) |
 | [`api.py`](api.py) | HTTP API over all of the above (Phase 3) |
 | [`inspect_chroma.py`](inspect_chroma.py) | Read-only CLI for browsing what's indexed in `./chroma_db` |
+| [`generate_lab_test_data.py`](generate_lab_test_data.py) | Generates synthetic, schema-valid lab_report test data — no OCR/API calls needed |
 
 Deeper internals for each module are documented in [`docs/`](docs/).
 
 ## Setup
 
 ```
-pip install openai pdfplumber pymupdf pillow chromadb python-dotenv fastapi "uvicorn[standard]" python-multipart
+pip install openai pdfplumber pymupdf pillow chromadb python-dotenv python-dateutil fastapi "uvicorn[standard]" python-multipart
 ```
 
 Create a `.env` file in the project root (already gitignored):
@@ -149,6 +153,11 @@ Response `201`:
     ],
     "overall_recommendation": "Please consult your doctor or pharmacist before continuing this medication given your documented penicillin allergy."
   },
+  "lab_trends": {
+    "trends": [],
+    "insufficient_data": [],
+    "note": "This trend analysis is computed directly from the extracted lab values and reference ranges — it is not a diagnosis and does not account for clinical context beyond the numbers shown. Consult the patient's doctor or a pharmacist to interpret what any trend means for their care."
+  },
   "indexed": true
 }
 ```
@@ -196,6 +205,58 @@ Returns the patient's last saved cross-check report (same shape as
 ```
 curl http://127.0.0.1:8000/api/v1/patients/amit%20sharma/cross-check
 ```
+
+`404` if this patient has never been processed.
+
+#### `GET /api/v1/patients/{patient_key}/lab-trends`
+
+Returns the patient's lab result trends (same shape as `lab_trends` above)
+— per-test direction of drift across visits, when/if it crossed out of the
+reference range, and a plain-language explanation. Computed by
+[`lab_trends.py`](lab_trends.py) deterministically from the numbers
+already in the timeline (no LLM call).
+
+```
+curl http://127.0.0.1:8000/api/v1/patients/amit%20sharma/lab-trends
+```
+
+```json
+{
+  "trends": [
+    {
+      "test_name": "Fasting Glucose",
+      "unit": "mg/dL",
+      "reference_range": "70-99",
+      "data_points": [
+        {"date": "05 Jan 2026", "value": "91", "flag": "normal", "source_file": "John_Lab_Report_1.pdf"},
+        {"date": "20 Apr 2026", "value": "103", "flag": "high", "source_file": "John_Lab_Report_2.pdf"},
+        {"date": "30 Aug 2026", "value": "118", "flag": "high", "source_file": "John_Lab_Report_3.pdf"}
+      ],
+      "direction": "increasing",
+      "flag_sequence": "normal → high → high",
+      "crossed_into_abnormal_at": {"date": "20 Apr 2026", "flag": "high"},
+      "approaching_threshold": false,
+      "confidence": 0.95,
+      "explanation": "Fasting Glucose has risen across 3 tests (reference range 70-99 mg/dL), from 91 mg/dL to 118 mg/dL ... It moved from within the normal range into the 'high' range starting with the 20 Apr 2026 test, and has stayed there since."
+    }
+  ],
+  "insufficient_data": [
+    {"test_name": "TSH", "reason": "only 1 usable data point(s) with a parseable date and numeric value (need at least 2 to establish a trend); 0 entrie(s) were dropped."}
+  ],
+  "note": "This trend analysis is computed directly from the extracted lab values and reference ranges — it is not a diagnosis and does not account for clinical context beyond the numbers shown. Consult the patient's doctor or a pharmacist to interpret what any trend means for their care."
+}
+```
+
+A test still flagged `"normal"` can still show `"approaching_threshold": true`
+if it's been drifting toward a reference-range boundary across visits (e.g.
+Creatinine rising from 0.92 → 1.08 → 1.32 against a 0.74–1.35 range) — this
+surfaces that drift before it's officially out of range, not just after.
+
+Tests with fewer than 2 usable (dated + numeric) readings are listed under
+`insufficient_data` with a reason, rather than a fabricated single-point
+"trend". Reports saved before this feature existed don't have a
+`lab_trends` field on disk — this endpoint recomputes it on the fly from
+the saved timeline in that case.
 
 `404` if this patient has never been processed.
 
@@ -339,6 +400,34 @@ curl -X DELETE http://127.0.0.1:8000/api/v1/patients/amit%20sharma/sessions/29d7
 `204` on success, `404` if `session_id` doesn't exist.
 
 ---
+
+## Test data
+
+[`generate_lab_test_data.py`](generate_lab_test_data.py) produces
+synthetic but schema-valid `lab_report` documents — same shape
+`process_document()` returns — without any OCR or OpenAI calls, so you can
+exercise `build_patient_timeline()`, `document_filter.py`, and
+`lab_trends.py` for free:
+
+```
+python generate_lab_test_data.py --patient "jane doe" --visits 4 --out test_data/lab_results_fixture.json
+```
+
+```python
+import json
+from medical_extractor import build_patient_timeline
+from document_filter import filter_non_medical_documents
+from lab_trends import track_lab_trends
+
+docs = json.load(open("test_data/lab_results_fixture.json"))
+kept, rejected = filter_non_medical_documents(docs)
+timeline = build_patient_timeline(kept)
+trends = track_lab_trends(timeline)
+```
+
+Note this bypasses OCR — it feeds directly into the pipeline at the
+"already extracted" stage, so it's not something you multipart-upload
+through `/documents` (that endpoint only accepts real files).
 
 ## Inspecting the vector store
 
