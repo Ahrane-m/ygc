@@ -68,6 +68,32 @@ All application routes are under the `/api/v1/` prefix.
 
 ---
 
+## Deploying to Railway
+
+`requirements.txt` and `Procfile` (`web: uvicorn api:app --host 0.0.0.0 --port $PORT`)
+are already set up — Railway's Nixpacks builder detects both automatically,
+so a plain "Deploy from GitHub repo" works with no extra build config.
+
+1. **Env vars** — in the Railway service's Variables tab, set everything
+   from `.env.example` (`OPENAI_API_KEY`, `CLOUDINARY_CLOUD_NAME`,
+   `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`, `MONGODB_URI`,
+   `JWT_SECRET`). Don't upload `.env` itself — it's git-ignored and holds
+   live secrets.
+2. **Persisting the vector store** — Railway's container filesystem is
+   rebuilt on every deploy, so anything written to disk (the local Chroma
+   store under `./chroma_db`) would otherwise vanish on the next deploy or
+   restart, silently dropping every indexed patient's Q&A data even though
+   MongoDB/Cloudinary data is untouched. Fix: attach a
+   [Railway Volume](https://docs.railway.com/guides/volumes) to the
+   service (Settings → Volumes), mount it at e.g. `/data/chroma_db`, and
+   set the env var `CHROMA_DIR=/data/chroma_db`. `retrieval.py` reads
+   `CHROMA_DIR` from the environment (falling back to `./chroma_db` for
+   local dev), so no code change is needed beyond setting that variable.
+3. Deploy. Railway assigns `$PORT` automatically; the `Procfile` binds to
+   it.
+
+---
+
 ## Authentication
 
 Every route except `/health` requires two headers:

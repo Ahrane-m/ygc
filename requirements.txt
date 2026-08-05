@@ -1,0 +1,13 @@
+openai
+pdfplumber
+pymupdf
+pillow
+chromadb
+python-dotenv
+python-dateutil
+fastapi
+uvicorn[standard]
+python-multipart
+pymongo
+cloudinary
+pyjwt
