@@ -1,11 +1,11 @@
 """
 HTTP API (Phase 3 + 4)
 =========================================
-Exposes the extraction -> timeline -> cross-check -> retrieval -> conversation
-pipeline (medical_extractor.py, retrieval.py, conversation.py) over HTTP,
-under the /api/v1/ prefix. This is a thin wrapper — all business logic stays
-in those modules; this file only handles request/response marshalling,
-validation, and HTTP status codes.
+Exposes the extraction -> timeline -> cross-check -> trend-track -> retrieval
+-> conversation pipeline (medical_extractor.py, lab_trends.py, retrieval.py,
+conversation.py) over HTTP, under the /api/v1/ prefix. This is a thin
+wrapper — all business logic stays in those modules; this file only handles
+request/response marshalling, validation, and HTTP status codes.
 
 Every route except /health requires an authenticated caller (see auth.py):
     Authorization: Bearer <jwt>
@@ -43,6 +43,7 @@ import db
 import storage
 from auth import get_current_user
 from document_filter import NonMedicalDocumentError, assert_medical_document
+from lab_trends import track_lab_trends
 from medical_extractor import (
     _is_demo_document,
     build_patient_timeline,
@@ -82,7 +83,7 @@ class MessageRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Documents / timeline / cross-check
+# Documents / timeline / cross-check / lab trends
 # ---------------------------------------------------------------------------
 
 @app.post("/api/v1/documents", status_code=201)
@@ -93,8 +94,8 @@ async def upload_documents(
     """
     Uploads one or more documents (PDF/image) for the authenticated user.
     Extracts each, merges the results with any documents previously
-    uploaded by this user, rebuilds the timeline, re-runs cross-checking,
-    and re-indexes for Q&A.
+    uploaded by this user, rebuilds the timeline, re-runs cross-checking
+    and lab trend tracking, and re-indexes for Q&A.
     """
     logger.info("upload_documents: user=%s received %d file(s)", user_id, len(files))
     if not files:
@@ -203,6 +204,12 @@ async def upload_documents(
         user_id, issue_count,
     )
 
+    lab_trends = track_lab_trends(timeline)
+    logger.info(
+        "upload_documents: user=%s lab trend tracking found %d trend(s), %d test(s) with insufficient data",
+        user_id, len(lab_trends["trends"]), len(lab_trends["insufficient_data"]),
+    )
+
     indexed, index_error = True, None
     try:
         index_patient_timeline(user_id, timeline)
@@ -214,7 +221,7 @@ async def upload_documents(
         )
 
     db.insert_documents(user_id, new_docs)
-    db.save_patient_snapshot(user_id, timeline, cross_check)
+    db.save_patient_snapshot(user_id, timeline, cross_check, lab_trends=lab_trends)
     logger.info(
         "upload_documents: user=%s request complete: documents_added=%d documents_total=%d indexed=%s",
         user_id, len(new_docs), len(all_docs), indexed,
@@ -226,6 +233,7 @@ async def upload_documents(
         "documents_total": len(all_docs),
         "timeline": timeline,
         "cross_check_report": cross_check,
+        "lab_trends": lab_trends,
         "indexed": indexed,
     }
     if not indexed:
@@ -251,6 +259,21 @@ async def get_cross_check(user_id: str = Depends(get_current_user)) -> Dict[str,
     if snapshot is None:
         raise HTTPException(404, "No cross-check report found for this user.")
     return snapshot["cross_check_report"]
+
+
+@app.get("/api/v1/lab-trends")
+async def get_lab_trends(user_id: str = Depends(get_current_user)) -> Dict[str, Any]:
+    """Returns the authenticated user's lab result trends (direction of
+    drift per test, reference-range crossings, plain-language explanations)
+    computed from the most recent upload/processing run. Recomputed on the
+    fly from the saved timeline for snapshots saved before this field
+    existed."""
+    snapshot = db.load_patient_snapshot(user_id)
+    if snapshot is None:
+        raise HTTPException(404, "No timeline found for this user.")
+    if "lab_trends" in snapshot:
+        return snapshot["lab_trends"]
+    return track_lab_trends(snapshot["patient_timeline"])
 
 
 # ---------------------------------------------------------------------------

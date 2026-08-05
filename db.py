@@ -14,8 +14,8 @@ the existing `users` collection already lives in):
                         Cloudinary document_url — no raw file bytes, no
                         OpenAI request/response payloads, no access tokens.
     patient_snapshots   one record per user: the last-built patient_timeline
-                        + cross_check_report (mirrors what the CLI writes
-                        to patient_report_<name>.json).
+                        + cross_check_report + lab_trends (mirrors what the
+                        CLI writes to patient_report_<name>.json).
 
 Env:
     MONGODB_URI   connection string (database name taken from its path)
@@ -83,15 +83,20 @@ def load_patient_snapshot(user_id: str) -> Optional[Dict[str, Any]]:
     return _snapshots().find_one({"user_id": user_id}, {"_id": 0})
 
 
-def save_patient_snapshot(user_id: str, timeline: Dict[str, Any], cross_check: Dict[str, Any]) -> None:
-    """Upserts the merged timeline + cross-check report for this user."""
-    _snapshots().update_one(
-        {"user_id": user_id},
-        {"$set": {
-            "user_id": user_id,
-            "patient_timeline": timeline,
-            "cross_check_report": cross_check,
-            "updated_at": _now_iso(),
-        }},
-        upsert=True,
-    )
+def save_patient_snapshot(
+    user_id: str,
+    timeline: Dict[str, Any],
+    cross_check: Dict[str, Any],
+    lab_trends: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Upserts the merged timeline + cross-check report (+ lab trends, if
+    computed) for this user."""
+    fields: Dict[str, Any] = {
+        "user_id": user_id,
+        "patient_timeline": timeline,
+        "cross_check_report": cross_check,
+        "updated_at": _now_iso(),
+    }
+    if lab_trends is not None:
+        fields["lab_trends"] = lab_trends
+    _snapshots().update_one({"user_id": user_id}, {"$set": fields}, upsert=True)

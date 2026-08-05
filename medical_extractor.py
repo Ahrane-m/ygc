@@ -861,15 +861,23 @@ def load_patient_report(patient_key: str) -> Optional[Dict[str, Any]]:
 
 
 def save_patient_report(
-    patient_key: str, timeline: Dict[str, Any], cross_check: Dict[str, Any]
+    patient_key: str,
+    timeline: Dict[str, Any],
+    cross_check: Dict[str, Any],
+    lab_trends: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Writes the merged timeline + cross-check report to disk — same shape
-    and naming convention the CLI __main__ flow has always used."""
+    """Writes the merged timeline + cross-check report (+ optional lab
+    trend analysis) to disk — same shape and naming convention the CLI
+    __main__ flow has always used. `lab_trends` is optional so callers
+    (and old saved reports on disk, loaded back via load_patient_report())
+    that predate lab trend tracking keep working unchanged."""
     output = {
         "patient_key": patient_key,
         "patient_timeline": timeline,
         "cross_check_report": cross_check,
     }
+    if lab_trends is not None:
+        output["lab_trends"] = lab_trends
     with open(_patient_report_path(patient_key), "w") as f:
         json.dump(output, f, indent=2)
 
@@ -942,6 +950,10 @@ if __name__ == "__main__":
         print("Cross-checking prescriptions ...")
         cross_check = cross_check_prescriptions(timeline)
 
+        print("Tracking lab result trends ...")
+        from lab_trends import track_lab_trends
+        lab_trends = track_lab_trends(timeline)
+
         print("Indexing timeline for retrieval (Q&A) ...")
         try:
             index_patient_timeline(patient_key, timeline)
@@ -951,7 +963,7 @@ if __name__ == "__main__":
         # Persist raw docs too (not just the merged report) so a later API
         # upload for this same patient can merge new documents in.
         save_patient_documents(patient_key, docs)
-        save_patient_report(patient_key, timeline, cross_check)
+        save_patient_report(patient_key, timeline, cross_check, lab_trends=lab_trends)
         out_path = _patient_report_path(patient_key)
 
         print(f"Saved report to {out_path}")
