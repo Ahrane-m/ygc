@@ -34,7 +34,7 @@ from medical_extractor import client, MODEL
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = MODEL  # reuse the same chat model configured in medical_extractor.py
 
-CHROMA_DIR = "./chroma_db"
+CHROMA_DIR = os.environ.get("CHROMA_DIR", "./chroma_db")
 EMBEDDING_BATCH_SIZE = 100  # keep well under the API's per-request item limit
 
 
