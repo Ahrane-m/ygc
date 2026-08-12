@@ -194,12 +194,21 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
 def _sanitize_collection_name(patient_key: str) -> str:
     """Chroma collection names must be 3-63 chars, start/end alphanumeric,
     and contain only [a-zA-Z0-9._-]. This maps an arbitrary patient_key
-    (e.g. 'amit sharma') into a safe, stable collection name."""
+    (e.g. 'amit sharma') into a safe, stable collection name.
+
+    Truncation to 63 chars happens BEFORE the end-alphanumeric fixup (not
+    after) — truncating last can cut a long name off mid-separator (e.g.
+    right after a '-'), leaving a non-alphanumeric last character that
+    violates Chroma's naming rule. Trimming trailing separators post-
+    truncation and re-applying the alnum-ending fix closes that gap."""
     name = re.sub(r"[^a-z0-9._-]+", "_", patient_key.strip().lower()).strip("_.-")
     if not name:
         name = "patient"
     if not name[0].isalnum():
         name = "p" + name
+    name = name[:63].rstrip("_.-")
+    if not name:
+        name = "patient"
     if not name[-1].isalnum():
         name = name + "0"
     while len(name) < 3:

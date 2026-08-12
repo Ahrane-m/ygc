@@ -171,7 +171,7 @@ def _explain(
     elif approaching:
         base += (
             f" It's still within the normal range but has been trending toward the "
-            f"{'upper' if direction.startswith('increasing') else 'lower'} boundary — worth watching even "
+            f"{'upper' if 'increasing' in direction else 'lower'} boundary — worth watching even "
             "though it hasn't been flagged abnormal yet."
         )
     elif direction == "stable":
@@ -330,6 +330,24 @@ if __name__ == "__main__":
     # Regression check for the reference-range parsing bug (hyphen
     # mis-read as a negative sign): must render as "70-99", not "-99-70".
     assert "70-99 mg/dL" in by_name["Fasting Glucose"]["explanation"], by_name["Fasting Glucose"]["explanation"]
+
+    # Regression check for the "fluctuating (net increasing)" boundary-wording
+    # bug: direction.startswith("increasing") used to miss this case (it starts
+    # with "fluctuating"), so the explanation wrongly said "lower boundary"
+    # for a value that was actually climbing toward the upper one.
+    fluctuating_timeline = {
+        "lab_results_timeline": [
+            {"test_name": "Glucose", "value": "75", "unit": "mg/dL", "reference_range": "70-100", "flag": "normal", "confidence": 0.9, "date": "2026-01-01", "source_file": "a.pdf"},
+            {"test_name": "Glucose", "value": "98", "unit": "mg/dL", "reference_range": "70-100", "flag": "normal", "confidence": 0.9, "date": "2026-02-01", "source_file": "b.pdf"},
+            {"test_name": "Glucose", "value": "97", "unit": "mg/dL", "reference_range": "70-100", "flag": "normal", "confidence": 0.9, "date": "2026-03-01", "source_file": "c.pdf"},
+        ]
+    }
+    fluctuating_result = track_lab_trends(fluctuating_timeline)
+    glucose_trend = fluctuating_result["trends"][0]
+    assert glucose_trend["direction"] == "fluctuating (net increasing)", glucose_trend["direction"]
+    assert glucose_trend["approaching_threshold"] is True
+    assert "upper boundary" in glucose_trend["explanation"], glucose_trend["explanation"]
+    assert "lower boundary" not in glucose_trend["explanation"], glucose_trend["explanation"]
 
     for t in result["trends"]:
         print(f"--- {t['test_name']} ---")

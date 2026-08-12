@@ -421,16 +421,38 @@ def _flatten_documents(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return flat
 
 
+# Best-effort, non-exhaustive placeholder markers across the languages this
+# pipeline is expected to see (see EXTRACTION_SCHEMA_PROMPT's language/unit
+# normalization section). patient_name and medication "name" are NOT
+# translated by the extractor (only "ingredients" is normalized to English),
+# so an English-only check misses a demo document printed in another
+# language. This list can't cover every language a patient's documents
+# might be in — it's a pragmatic net for the common cases, not a guarantee.
+DEMO_PLACEHOLDER_MARKERS = frozenset({
+    "DEMO", "SAMPLE", "DUMMY", "TEST PATIENT", "PLACEHOLDER",   # English
+    "மாதிரி", "டெமோ",                                             # Tamil (sample / demo)
+    "නියැදිය", "ආදර්ශ",                                          # Sinhala (sample / model-example)
+    "डेमो", "नमूना", "उदाहरण",                                    # Hindi (demo / sample / example)
+    "MUESTRA", "EJEMPLO", "PRUEBA",                               # Spanish (sample / example / test)
+    "EXEMPLE", "ÉCHANTILLON",                                     # French (example / sample)
+    "デモ", "サンプル",                                             # Japanese (demo / sample)
+    "تجريبي", "عينة", "نموذج",                                    # Arabic (trial/demo / sample / model)
+})
+
+
 def _is_demo_document(d: Dict[str, Any]) -> bool:
     """Detect placeholder/template documents (e.g. sample datasets that
     include a 'DEMO PATIENT' / 'DEMO MEDICINE' mock page) so they don't get
-    silently treated as real patient data."""
+    silently treated as real patient data. Checks both English and a
+    best-effort set of transliterated equivalents (see
+    DEMO_PLACEHOLDER_MARKERS) since patient/medication names are printed in
+    the document's original language, not translated during extraction."""
     name = (d.get("patient_name") or "").upper()
-    if "DEMO" in name or "SAMPLE" in name or "DUMMY" in name:
+    if any(marker in name for marker in DEMO_PLACEHOLDER_MARKERS):
         return True
     for med in d.get("medications", []):
         med_name = (med.get("name") or "").upper()
-        if "DEMO" in med_name or "SAMPLE" in med_name:
+        if any(marker in med_name for marker in DEMO_PLACEHOLDER_MARKERS):
             return True
     return False
 

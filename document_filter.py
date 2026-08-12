@@ -17,6 +17,17 @@ filtering is O(1) dict lookups — no extra OCR, no extra OpenAI request, no
 added latency — and it runs *before* the expensive downstream work (timeline
 rebuild, cross-check LLM call, Chroma re-indexing), so a rejected file never
 pays for any of that either.
+
+Multilingual documents: this filter never inspects raw document text or
+language — every check below is a presence/type/number check on already-
+extracted structured fields, which medical_extractor.py's extraction prompt
+normalizes consistently (e.g. medication "ingredients" -> English INN)
+regardless of what language the source document was in. That means the cost
+and behavior of filtering are identical for a Tamil prescription, an Arabic
+lab report, or an English discharge summary — there is no per-language
+branch to add or maintain here. See the multilingual cases in this file's
+__main__ self-test below for worked examples (a real Tamil prescription
+kept, a Tamil-language non-medical screenshot rejected).
 """
 
 from typing import Any, Dict, List, Tuple
@@ -194,11 +205,64 @@ if __name__ == "__main__":
         "overall_confidence": 0.78,
     }
 
-    kept, rejected = filter_non_medical_documents(
-        [real_prescription, empty_other, unusual_but_real, mistagged_screenshot, conference_slide_screenshot]
-    )
-    assert len(kept) == 2, f"expected 2 kept, got {len(kept)}"
-    assert len(rejected) == 3, f"expected 3 rejected, got {len(rejected)}"
+    # --- Multilingual cases -------------------------------------------------
+    # The filter never inspects raw document text or language — it only
+    # checks the already-extracted structured fields (medications,
+    # lab_results, allergies_noted, document_type, overall_confidence).
+    # medical_extractor.py's extraction prompt normalizes "ingredients" to
+    # English INN regardless of source language, so these fields are
+    # populated the same way whether the source document was English,
+    # Tamil, Arabic, or anything else — no language-specific logic is
+    # needed here, and none should be added.
+    tamil_prescription = {
+        # corresponds to multilingual/M1.1_tamil_prescription.txt in the
+        # test dataset: a real Tamil-script prescription for Metformin +
+        # Amlodipine. "name" stays as printed (Tamil); "ingredients" is
+        # normalized to English by the extractor.
+        "document_type": "prescription",
+        "medications": [
+            {"name": "மெட்ஃபோர்மின்", "ingredients": ["Metformin"], "confidence": 0.88},
+            {"name": "அம்லோடிபின்", "ingredients": ["Amlodipine"], "confidence": 0.85},
+        ],
+        "lab_results": [],
+        "allergies_noted": [],
+        "clinical_notes": "மருந்தளிக்கும் மருத்துவர்: டாக்டர் சு. பெரேரா",
+        "overall_confidence": 0.86,
+    }
+    arabic_low_confidence_prescription = {
+        # corresponds to multilingual/M3.3_rtl_arabic_sample.txt: a
+        # right-to-left script document, correctly typed but with lower
+        # confidence (handwriting/RTL uncertainty) — should still pass on
+        # document_type + confidence even before considering content.
+        "document_type": "prescription",
+        "medications": [],
+        "lab_results": [],
+        "allergies_noted": [],
+        "clinical_notes": None,
+        "overall_confidence": 0.42,
+    }
+    non_medical_tamil_screenshot = {
+        # a Tamil-language screenshot with no clinical content — must be
+        # rejected exactly like the English conference-slide case above,
+        # proving clinical_notes text is ignored regardless of language.
+        "document_type": "other",
+        "medications": [],
+        "lab_results": [],
+        "allergies_noted": [],
+        "clinical_notes": "விழா அழைப்பிதழ் - திருமண அழைப்பு",  # "Event invitation - wedding invite"
+        "overall_confidence": 0.7,
+    }
+
+    kept, rejected = filter_non_medical_documents([
+        real_prescription, empty_other, unusual_but_real, mistagged_screenshot,
+        conference_slide_screenshot, tamil_prescription,
+        arabic_low_confidence_prescription, non_medical_tamil_screenshot,
+    ])
+    assert len(kept) == 4, f"expected 4 kept, got {len(kept)}"
+    assert len(rejected) == 4, f"expected 4 rejected, got {len(rejected)}"
+    assert tamil_prescription in kept
+    assert arabic_low_confidence_prescription in kept
+    assert non_medical_tamil_screenshot in rejected
 
     try:
         assert_medical_document(empty_other, "boarding_pass.jpg")
