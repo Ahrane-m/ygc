@@ -26,9 +26,9 @@ There is no vector store. A patient's record is small enough to answer from
 whole, and every question this product exists to answer is a completeness
 question ("what am I taking?", "did my dose change?") rather than a
 similarity one — so retrieval is deterministic assembly of the saved
-snapshot, not approximate nearest-neighbour search over chunks. See
-[`docs/retrieval.md`](docs/retrieval.md) for the reasoning and the
-budget-constrained fallback.
+snapshot, not approximate nearest-neighbour search over chunks. The reasoning
+and the budget-constrained fallback are documented in
+[`retrieval.py`](retrieval.py)'s own module docstring.
 
 | Module | Responsibility |
 |---|---|
@@ -890,6 +890,7 @@ the context budget.
   is unauthenticated by design (local dev/testing tool) and still writes to
   local `patient_report_*.json` / `patient_docs_*.json` files — it does not
   touch MongoDB or Cloudinary.
-- See [`docs/pipeline.md`](docs/pipeline.md), [`docs/medical_extractor.md`](docs/medical_extractor.md),
-  and [`docs/retrieval.md`](docs/retrieval.md) for how extraction, timeline
-  building, and retrieval work internally.
+- See [`docs/pipeline.md`](docs/pipeline.md) and
+  [`docs/medical_extractor.md`](docs/medical_extractor.md) for how extraction
+  and timeline building work internally, and [`retrieval.py`](retrieval.py)'s
+  module docstring for the retrieval design.

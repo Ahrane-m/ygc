@@ -109,47 +109,39 @@ Runs **after** cross-checking and lab-trend tracking, over the findings they alr
 
 Run `python consult_triage.py` for the offline self-test (no API key or network needed — it exercises the routing table directly).
 
-## 5. Retrieval-Augmented Q&A (`retrieval.py`, Phase 1)
+## 5. Structured Retrieval + Q&A (`retrieval.py`, Phase 1)
 
 Sits on top of the **already-extracted** structured timeline — it does not re-read raw documents.
 
 ```
-timeline → chunks → embeddings (text-embedding-3-small) → per-patient Chroma collection (./chroma_db)
-question → embedding → top_k similarity search → cited context → chat model → structured JSON answer
+patient snapshot (Mongo, or the CLI's local JSON report)
+  → render document manifest + allergies + medication rollups
+    + lab series w/ trends + clinical notes + safety flags + consult routing
+  → (only if over budget) plan which entities matter, re-render narrowed
+  → answer strictly from that context, with a post-hoc safety guard
 ```
 
-### Chunking
+**There is no vector store, and this is deliberate** — see `retrieval.py`'s module docstring for the full reasoning. In short: the retrieval unit is one patient's own record (tens to a few hundred entries, not a corpus), and every headline question is a *completeness* question ("what am I taking?", "has my dose changed?") rather than a similarity one. Top-k cosine similarity silently drops exactly the evidence that makes those answers correct, and a dropped medication in a drug-interaction answer is a safety failure, not a relevance miss.
 
-`build_chunks_from_timeline()` produces one chunk per:
+So retrieval is deterministic assembly: load the saved snapshot, render it grouped by document *and* rolled up per entity across documents, and hand the whole thing over. **The common path makes zero extra API calls** — a planner LLM narrows the record only when it exceeds `QA_CONTEXT_BUDGET_CHARS` (default 48000).
 
-| chunk_type       | source                                   |
-|-------------------|-------------------------------------------|
-| `medication`       | each entry in `medications_timeline`       |
-| `lab_result`        | each entry in `lab_results_timeline`        |
-| `clinical_note`     | each visit with non-null `clinical_notes`   |
-| `allergy`           | one chunk listing all `known_allergies`      |
+### Context assembly
 
-Each chunk has a natural-language `text` (what gets embedded) and `metadata` (`patient_key`, `date`, `source_file`, `chunk_type`).
-
-### Storage
-
-- One Chroma collection per patient, name = sanitized `patient_key` (`_sanitize_collection_name()`), persisted to `./chroma_db` via `chromadb.PersistentClient`.
-- Chunk IDs are deterministic (`sha256(patient_key|source_file|chunk_type|index)`), so `index_patient_timeline()` can be called repeatedly on the same documents — it `upsert()`s instead of duplicating.
+`build_full_context(record)` renders the whole record. `_fit_to_budget()` trims only when it must, and never trims the mandatory sections — the document manifest, the allergy list, the safety cross-check, and the consultation routing. Cutting those turns a space problem into a safety problem: a truncated manifest makes "that isn't in your records" a lie, and a truncated allergy list makes the consult recommendation fire on incomplete grounds.
 
 ### Answering
 
-`answer_question(patient_key, question, chat_history=None, top_k=8)`:
+`answer_question(patient_key, question, chat_history=None, retrieval_query=None, record=None, focus=None)` calls the chat model under a system prompt that:
 
-1. Embeds the question.
-2. Queries the patient's collection for the `top_k` most similar chunks.
-3. Builds a prompt with retrieved chunks (tagged with date/source_file), optional `chat_history`, and the question.
-4. Calls the chat model under a system prompt that:
-   - answers **only** from retrieved context, saying "I don't have enough information" otherwise
-   - never gives a diagnosis
-   - forces `recommend_professional_consult: true` for anything touching risk, interactions, or dosage changes
-   - requires structured JSON output: `{"answer", "confidence", "sources": [{"date", "source_file"}], "recommend_professional_consult"}`
+- answers **only** from the assembled context, saying "I don't have enough information" otherwise
+- never gives a diagnosis
+- writes for a reader with no medical background (spells out abbreviations, "the normal range" not "reference range")
+- distinguishes VERIFIED / BACKED BY / UNVERIFIED safety findings, never restating unverified model knowledge as fact
+- answers "who should I see?" from the computed consultation routing rather than improvising
 
-Returns a graceful "no information" answer (no API calls) if the patient was never indexed or their collection is empty. Raises `ValueError` for a missing `patient_key`/`question`, `RuntimeError` if an OpenAI call fails.
+`_apply_safety_guard()` is a deterministic backstop that forces `recommend_professional_consult` for risk-related or low-confidence answers, and records *why* it fired — the model is already told to do this, but "already told to" is not a control.
+
+Returns a graceful "no information" answer (no API calls) if the patient has no processed records.
 
 ## 6. Wiring (`medical_extractor.py` `__main__`)
 
@@ -163,14 +155,12 @@ For each patient found: build timeline → cross-check → lab trends → consul
 ## Dependencies
 
 ```
-pip install openai pdfplumber pymupdf pillow chromadb --break-system-packages
+pip install -r requirements.txt
 ```
 
-```
-export OPENAI_API_KEY="sk-..."
-```
+Environment variables are listed in [`.env.example`](../.env.example).
 
 ## Status / Next steps
 
-- Phase 1 (this doc) covers Q&A grounded in structured, already-extracted fields only.
-- Not yet implemented: retrieval over raw document text/images, multi-patient comparison queries, auth/access control around `./chroma_db`, evaluation harness for answer quality.
+- Q&A is grounded in structured, already-extracted fields only.
+- Not yet implemented: retrieval over raw document text/images, multi-patient comparison queries, evaluation harness for answer quality, and drug-interaction reference data in the knowledge graph (without it, interaction and allergy findings grade as unverified `model_knowledge` — see `evidence_grading.py`).

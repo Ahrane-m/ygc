@@ -1,6 +1,6 @@
 # `medical_extractor.py` reference
 
-Extraction → grouping → timeline → cross-check pipeline. This is the "source of truth" module: it turns raw documents into structured JSON and a per-patient timeline. [`retrieval.py`](../retrieval.py) builds on top of its output and imports `client` and `MODEL` from here — don't rename those without checking [retrieval.md](retrieval.md).
+Extraction → grouping → timeline → cross-check pipeline. This is the "source of truth" module: it turns raw documents into structured JSON and a per-patient timeline. [`retrieval.py`](../retrieval.py) builds on top of its output and imports `client` and `MODEL` from here — don't rename those without checking [`retrieval.py`](../retrieval.py).
 
 ## Install / env
 
@@ -129,8 +129,8 @@ python medical_extractor.py "C:\path\to\Patient x"        # folder mode, auto-de
 python medical_extractor.py <path or files> --chat         # same, then interactive Q&A
 ```
 
-Per run: extract → `group_documents_by_patient()` → for each patient: `build_patient_timeline()` → `cross_check_prescriptions()` → `index_patient_timeline()` (imported from `retrieval.py`, lazily inside `__main__` to avoid a circular import — `retrieval.py` imports `client`/`MODEL` from this module at its top level) → writes `patient_report_<sanitized_name>.json` (full timeline + cross-check report).
+Per run: extract → language guard → `group_documents_by_patient()` → for each patient: `build_patient_timeline()` → `cross_check_prescriptions()` → `track_lab_trends()` → `triage_consultation()` → writes `patient_report_<sanitized_name>.json` (timeline + cross-check report + lab trends + consult triage).
 
-If `--chat` was passed: after all patients are processed, prompts you to pick a patient (if more than one), then loops `input()` → `answer_question()` → prints JSON, carrying `chat_history` forward across turns in that session. See [retrieval.md](retrieval.md) for what that call actually does.
+If `--chat` was passed: after all patients are processed, prompts you to pick a patient (if more than one), then loops `input()` → `answer_question()` → prints JSON, carrying `chat_history` forward across turns in that session. See [`retrieval.py`](../retrieval.py)'s module docstring for what that call actually does.
 
-**Note:** indexing failures are caught and logged per-patient (`  Indexing failed (Q&A won't be available for this patient): ...`) rather than aborting the run — a Chroma/embedding problem won't stop the extraction report from being written.
+**Note:** there is no separate indexing step. Saving the report *is* what makes a patient answerable — `retrieval.py` reads that snapshot directly, so there is no index to build, fall out of sync, or fail independently of the write.
