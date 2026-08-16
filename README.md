@@ -13,25 +13,35 @@ documents --extract--> Cloudinary (file) + MongoDB (structured data)
                         |         |
                         |         +--trend-track--> lab result trends
                         |
-                        +--------> index (Chroma)
+                        +--> patient snapshot (MongoDB)
                                         |
                                  question / conversation
                                         |
+                          context assembled from the whole record
+                                        |
                                     JSON answer
 ```
+
+There is no vector store. A patient's record is small enough to answer from
+whole, and every question this product exists to answer is a completeness
+question ("what am I taking?", "did my dose change?") rather than a
+similarity one — so retrieval is deterministic assembly of the saved
+snapshot, not approximate nearest-neighbour search over chunks. See
+[`docs/retrieval.md`](docs/retrieval.md) for the reasoning and the
+budget-constrained fallback.
 
 | Module | Responsibility |
 |---|---|
 | [`medical_extractor.py`](medical_extractor.py) | Extraction, timeline building, cross-checking, on-disk persistence (CLI) |
 | [`document_filter.py`](document_filter.py) | Rejects non-medical uploads (post-extraction, no extra API call) |
 | [`lab_trends.py`](lab_trends.py) | Tracks each lab test across visits — direction of drift, reference-range crossings, plain-language explanation (deterministic, no LLM call) |
-| [`retrieval.py`](retrieval.py) | Embedding + Chroma indexing, single-shot Q&A (Phase 1) |
-| [`conversation.py`](conversation.py) | Multi-turn sessions, query rewriting, safety-aware summarization (Phase 2) |
+| [`retrieval.py`](retrieval.py) | Cross-document context assembly + single-shot Q&A, with the deterministic consult/confidence guard (Phase 1) |
+| [`conversation.py`](conversation.py) | Multi-turn sessions, query rewriting, entity focus carry-over, safety-aware summarization (Phase 2) |
 | [`api.py`](api.py) | HTTP API over all of the above (Phase 3) |
 | [`auth.py`](auth.py) | Verifies the `Authorization`/`X-User-Id` headers on every API request (Phase 4) |
-| [`db.py`](db.py) | MongoDB persistence for uploaded documents + patient snapshots, scoped per user (Phase 4) |
+| [`db.py`](db.py) | MongoDB persistence for uploaded documents, patient snapshots, and conversation sessions, scoped per user (Phase 4) |
 | [`storage.py`](storage.py) | Uploads original documents to Cloudinary under `mediscan/<user_id>/` (Phase 4) |
-| [`inspect_chroma.py`](inspect_chroma.py) | Read-only CLI for browsing what's indexed in `./chroma_db` |
+| [`inspect_records.py`](inspect_records.py) | Read-only CLI showing exactly what context a question would be answered from |
 | [`generate_lab_test_data.py`](generate_lab_test_data.py) | Generates synthetic, schema-valid lab_report test data — no OCR/API calls needed |
 
 Deeper internals for each module are documented in [`docs/`](docs/).
@@ -39,11 +49,10 @@ Deeper internals for each module are documented in [`docs/`](docs/).
 ## Setup
 
 ```
-pip install openai pdfplumber pymupdf pillow chromadb python-dotenv python-dateutil fastapi "uvicorn[standard]" python-multipart pymongo cloudinary pyjwt
+pip install -r requirements.txt
 ```
 
-Create a `.env` file in the project root (already gitignored — copy
-`.env.example` and fill in real values):
+Create a `.env` file in the project root (already gitignored):
 
 ```
 OPENAI_API_KEY=sk-...
@@ -52,7 +61,20 @@ CLOUDINARY_API_KEY=...
 CLOUDINARY_API_SECRET=...
 MONGODB_URI=mongodb+srv://...
 JWT_SECRET=...          # same secret your auth issuer signs tokens with
+
+# Only needed for the antidote knowledge graph (poisoning_kg.py)
+NEO4J_URI=neo4j+s://...
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=...
+NEO4J_DATABASE=neo4j    # optional, defaults to "neo4j"
 ```
+
+Optional tuning:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `QA_CONTEXT_BUDGET_CHARS` | `48000` | How much of a patient's record can go into one question's context before retrieval narrows to a planned subset. |
+| `MONGODB_TIMEOUT_MS` | `8000` | Server-selection timeout, so an unreachable database fails a request rather than hanging it. |
 
 ## Running the API
 
@@ -75,20 +97,17 @@ are already set up — Railway's Nixpacks builder detects both automatically,
 so a plain "Deploy from GitHub repo" works with no extra build config.
 
 1. **Env vars** — in the Railway service's Variables tab, set everything
-   from `.env.example` (`OPENAI_API_KEY`, `CLOUDINARY_CLOUD_NAME`,
+   listed under [Setup](#setup) (`OPENAI_API_KEY`, `CLOUDINARY_CLOUD_NAME`,
    `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`, `MONGODB_URI`,
    `JWT_SECRET`). Don't upload `.env` itself — it's git-ignored and holds
    live secrets.
-2. **Persisting the vector store** — Railway's container filesystem is
-   rebuilt on every deploy, so anything written to disk (the local Chroma
-   store under `./chroma_db`) would otherwise vanish on the next deploy or
-   restart, silently dropping every indexed patient's Q&A data even though
-   MongoDB/Cloudinary data is untouched. Fix: attach a
-   [Railway Volume](https://docs.railway.com/guides/volumes) to the
-   service (Settings → Volumes), mount it at e.g. `/data/chroma_db`, and
-   set the env var `CHROMA_DIR=/data/chroma_db`. `retrieval.py` reads
-   `CHROMA_DIR` from the environment (falling back to `./chroma_db` for
-   local dev), so no code change is needed beyond setting that variable.
+   If you use the antidote knowledge graph, also set `NEO4J_URI`,
+   `NEO4J_USERNAME`, `NEO4J_PASSWORD` (and optionally `NEO4J_DATABASE`).
+2. **No volume needed.** The API keeps nothing on the container filesystem —
+   patient snapshots and conversation sessions both live in MongoDB, and
+   original files live in Cloudinary. Railway rebuilds the filesystem on
+   every deploy, so this matters: a restart loses nothing, and the service
+   is safe to run with more than one worker.
 3. Deploy. Railway assigns `$PORT` automatically; the `Procfile` binds to
    it.
 
@@ -323,22 +342,24 @@ the saved timeline in that case.
 
 #### `POST /api/v1/qa`
 
-Answers one question grounded in the authenticated user's indexed
-timeline. No server-side session — if you want multi-turn context, pass
-`chat_history` yourself, or use the conversation endpoints below instead.
+Answers one question grounded in the authenticated user's processed
+records. No server-side session — if you want multi-turn context, pass
+`chat_history` yourself, or use the conversation endpoints below instead
+(they also carry entity focus across turns, which `chat_history` alone
+does not).
 
 Request body:
 
 ```json
 {
   "question": "What was I prescribed for my sinus infection?",
-  "chat_history": [],
-  "top_k": 8
+  "chat_history": []
 }
 ```
 
-`chat_history` and `top_k` are optional (`chat_history` defaults to none,
-`top_k` defaults to `8`).
+`chat_history` is optional. `top_k` is still accepted so existing clients
+keep working, but it is **ignored** — retrieval assembles the whole record
+rather than the *k* nearest chunks.
 
 ```
 curl -X POST http://127.0.0.1:8000/api/v1/qa \
@@ -354,21 +375,49 @@ Response `200`:
   "answer": "You were prescribed Amoxicillin 500mg, three times daily for 7 days, on 2026-03-14.",
   "confidence": 0.9,
   "sources": [
-    {"date": "2026-03-14", "source_file": "prescription_march.pdf"}
+    {
+      "date": "2026-03-14",
+      "source_file": "prescription_march.pdf",
+      "document_type": "prescription",
+      "document_url": "https://res.cloudinary.com/..."
+    }
   ],
-  "recommend_professional_consult": false
+  "cross_document": false,
+  "recommend_professional_consult": false,
+  "low_confidence": false,
+  "retrieval": {"strategy": "full_record", "context_chars": 3184, "plan": null}
 }
 ```
 
-Errors: `400` empty question, `502` if the embedding/chat call fails.
+| Field | Meaning |
+|---|---|
+| `sources` | Every record the answer relied on. `document_type` and `document_url` are filled in from the timeline in code, not by the model. |
+| `cross_document` | Whether the answer combined facts from more than one document. |
+| `recommend_professional_consult` | Set by the model **and** forced on by a deterministic guard for risk-related questions, low-confidence answers, and partially-shown records. |
+| `low_confidence` | `confidence` was at or below `0.6`. |
+| `consult_reason` | Present when the guard fired; says plainly why. |
+| `retrieval.strategy` | `full_record` (the whole record was shown) or `planned` (too large — a selected subset was shown, and the context says what was left out). |
+
+Errors: `400` empty question, `502` if the chat call fails.
 
 ---
 
 ### Multi-turn conversation (Phase 2)
 
-A conversation session tracks turn history server-side (in-memory) and
-rewrites each follow-up into a self-contained search query before
-retrieval, so ambiguous questions like *"was that safe?"* retrieve well.
+A conversation session tracks turn history **in MongoDB** (so follow-ups
+still work after a restart, and across multiple workers) and resolves each
+follow-up two ways before answering:
+
+1. **Query rewriting** — *"was that safe?"* becomes a self-contained query.
+2. **Entity focus** — the session remembers which medications, lab tests and
+   documents the conversation is actually about, matched exactly against
+   that patient's own record. This is deterministic, so the subject of a
+   follow-up survives even if the rewrite call fails or drops a detail.
+
+Because the whole record is normally in context, a follow-up can compare
+across every uploaded document at once — *"has this changed since the
+discharge summary?"* is answerable without re-uploading or re-querying
+anything.
 
 #### `POST /api/v1/sessions`
 
@@ -394,8 +443,7 @@ Request body:
 
 ```json
 {
-  "question": "Was that safe with my allergy?",
-  "top_k": 8
+  "question": "Was that safe with my allergy?"
 }
 ```
 
@@ -406,19 +454,42 @@ curl -X POST http://127.0.0.1:8000/api/v1/sessions/29d7891954a543f1a48f19c9e06c7
   -d '{"question": "Was that safe with my allergy?"}'
 ```
 
-Response `200` — same shape as `/qa`, plus `rewritten_query`:
+Response `200` — same shape as `/qa`, plus `rewritten_query` and `focus`:
 
 ```json
 {
   "answer": "You have a documented Penicillin allergy, and Amoxicillin is a penicillin-class antibiotic — this is a potential allergy conflict. Please consult your doctor or pharmacist before continuing this medication.",
   "confidence": 0.85,
   "sources": [
-    {"date": "2026-03-14", "source_file": "prescription_march.pdf"}
+    {
+      "date": "2026-03-14",
+      "source_file": "prescription_march.pdf",
+      "document_type": "prescription",
+      "document_url": "https://res.cloudinary.com/..."
+    },
+    {
+      "date": "2026-01-08",
+      "source_file": "discharge_january.pdf",
+      "document_type": "discharge_summary",
+      "document_url": "https://res.cloudinary.com/..."
+    }
   ],
+  "cross_document": true,
   "recommend_professional_consult": true,
-  "rewritten_query": "Is Amoxicillin, prescribed to the patient on 2026-03-14, safe given the patient's known drug allergies?"
+  "low_confidence": false,
+  "consult_reason": "Please confirm this with a doctor or pharmacist, because the question involves safety, interactions, allergies, or a dosage change.",
+  "rewritten_query": "Is Amoxicillin, prescribed to the patient on 2026-03-14, safe given the patient's known drug allergies?",
+  "focus": {
+    "medications": ["Amoxicillin"],
+    "lab_tests": [],
+    "source_files": ["prescription_march.pdf", "discharge_january.pdf"]
+  }
 }
 ```
+
+`focus` is what the next follow-up will inherit — the drug came from the
+prescription, the allergy from the discharge summary, and both stay in scope
+for the rest of the conversation.
 
 Errors: `404` unknown `session_id` (create one first via `POST /sessions`),
 `400` empty question, `502` if an underlying OpenAI call fails.
@@ -453,7 +524,7 @@ Response `200`:
 
 #### `DELETE /api/v1/sessions/{session_id}`
 
-Ends a session, freeing its in-memory turn history.
+Ends a session, deleting its stored turn history and entity focus.
 
 ```
 curl -X DELETE -H "Authorization: Bearer $TOKEN" -H "X-User-Id: $USER_ID" \
@@ -493,37 +564,45 @@ Note this bypasses OCR — it feeds directly into the pipeline at the
 "already extracted" stage, so it's not something you multipart-upload
 through `/documents` (that endpoint only accepts real files).
 
-## Inspecting the vector store
+## Inspecting what a question is answered from
 
-`./chroma_db` holds one Chroma collection per user (chunk text +
-embeddings + metadata), keyed by `user_id` via the HTTP API (or by
-patient name when run through the CLI). [`inspect_chroma.py`](inspect_chroma.py)
-is a read-only CLI for browsing it without writing throwaway scripts — it
-never modifies the store or calls OpenAI.
+Retrieval is deterministic, so the context a question would be answered from
+can be printed exactly. [`inspect_records.py`](inspect_records.py) does that,
+read-only:
 
 ```
-python inspect_chroma.py                            # list every collection + chunk count
-python inspect_chroma.py "<user_id>"                 # show chunks for one user
-python inspect_chroma.py "<user_id>" --limit 20      # show more chunks
-python inspect_chroma.py "<user_id>" --type medication   # filter by chunk_type
+python inspect_records.py "<user_id>"                              # full assembled context
+python inspect_records.py "<user_id>" --summary                    # inventory + context size
+python inspect_records.py "<user_id>" --question "did my dose change?"
 ```
 
-`--type` accepts `medication`, `lab_result`, `clinical_note`, or `allergy`
-(see [`docs/retrieval.md`](docs/retrieval.md) for what each chunk_type
-contains).
+`<user_id>` for API-ingested records, or the patient name for records
+processed through the `medical_extractor.py` CLI. `--summary` also lists the
+entity vocabulary a follow-up can be resolved against, and calls out any
+medication whose dose or frequency changed across documents. No OpenAI call
+is made unless a `--question` is given *and* the record is too large to fit
+the context budget.
 
 ## Notes / limitations
 
-- Sessions are held in-memory per process — restarting the API drops all
-  active conversations (turn history isn't lost from disk, since it was
-  never persisted there; see `conversation.py`).
-- Document storage is split: the original uploaded file lives in
-  Cloudinary (`mediscan/<user_id>/...`), its structured extraction lives in
-  MongoDB (`documents`, `patient_snapshots` collections), and only its
-  embeddings live in the local `./chroma_db`. All three are scoped by the
-  authenticated `user_id` (see [`auth.py`](auth.py), [`db.py`](db.py),
-  [`storage.py`](storage.py)) — no raw file bytes, OpenAI request/response
-  payloads, or access tokens are ever persisted.
+- Document storage is split two ways: the original uploaded file lives in
+  Cloudinary (`mediscan/<user_id>/...`) and its structured extraction lives
+  in MongoDB (`documents`, `patient_snapshots`, `conversation_sessions`
+  collections). Both are scoped by the authenticated `user_id` (see
+  [`auth.py`](auth.py), [`db.py`](db.py), [`storage.py`](storage.py)) — no
+  raw file bytes, OpenAI request/response payloads, or access tokens are
+  ever persisted, and nothing patient-identifying is written to local disk
+  by the API.
+- Answering a question sends that patient's whole record to the model when
+  it fits the context budget (`QA_CONTEXT_BUDGET_CHARS`, default 48000
+  chars). That is the point — completeness is what makes cross-document
+  answers correct — but it does mean per-question token cost grows with
+  record size, where a top-k vector search would have stayed flat. Very
+  large records fall back to a planned subset; `inspect_records.py
+  --summary` shows which regime a given patient is in.
+- Entity focus is matched against the patient's own record vocabulary, so a
+  follow-up naming a drug the patient has never been prescribed resolves to
+  nothing and falls back to the rewritten query alone.
 - The CLI entry point in `medical_extractor.py` (`python medical_extractor.py ...`)
   is unauthenticated by design (local dev/testing tool) and still writes to
   local `patient_report_*.json` / `patient_docs_*.json` files — it does not

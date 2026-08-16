@@ -2,7 +2,6 @@ openai
 pdfplumber
 pymupdf
 pillow
-chromadb
 python-dotenv
 python-dateutil
 fastapi
@@ -11,3 +10,4 @@ python-multipart
 pymongo
 cloudinary
 pyjwt
+neo4j

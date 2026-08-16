@@ -466,6 +466,39 @@ def _normalize_patient_key(name: Any) -> str:
     return name.strip().lower()
 
 
+def find_patient_name_mismatch(
+    labeled_pages: List[Tuple[str, Dict[str, Any]]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Checks a list of (label, extracted_page) pairs — e.g. filenames paired
+    with their process_document() result — for more than one distinct
+    patient name (via _normalize_patient_key). Pages with no name
+    ("unknown_patient") are ignored rather than treated as a conflict.
+
+    Returns None if every named page agrees, otherwise a dict describing
+    the distinct names found and which label each came from, for the
+    caller to surface as a confirmation prompt.
+    """
+    by_name: Dict[str, List[str]] = {}
+    for label, page in labeled_pages:
+        key = _normalize_patient_key(page.get("patient_name"))
+        if key == "unknown_patient":
+            continue
+        by_name.setdefault(key, []).append(label)
+
+    if len(by_name) <= 1:
+        return None
+
+    return {
+        "distinct_patient_names": sorted(by_name),
+        "documents": [
+            {"label": label, "patient_name": name}
+            for name, labels in by_name.items()
+            for label in labels
+        ],
+    }
+
+
 def group_documents_by_patient(
     raw_results: List[Dict[str, Any]], drop_demo_documents: bool = True
 ) -> Dict[str, List[Dict[str, Any]]]:
@@ -918,10 +951,6 @@ if __name__ == "__main__":
         print("  Then chat about it:     add --chat to either form above")
         sys.exit(1)
 
-    # Imported here (not at module top) so retrieval.py's `from
-    # medical_extractor import client, MODEL` doesn't create a circular import.
-    from retrieval import index_patient_timeline
-
     args = sys.argv[1:]
     chat_mode = "--chat" in args
     args = [a for a in args if a != "--chat"]
@@ -976,14 +1005,11 @@ if __name__ == "__main__":
         from lab_trends import track_lab_trends
         lab_trends = track_lab_trends(timeline)
 
-        print("Indexing timeline for retrieval (Q&A) ...")
-        try:
-            index_patient_timeline(patient_key, timeline)
-        except Exception as e:
-            print(f"  Indexing failed (Q&A won't be available for this patient): {e}")
-
         # Persist raw docs too (not just the merged report) so a later API
-        # upload for this same patient can merge new documents in.
+        # upload for this same patient can merge new documents in. Saving the
+        # report is also what makes this patient answerable via --chat:
+        # retrieval.py reads the saved report directly, so there is no
+        # separate index to build.
         save_patient_documents(patient_key, docs)
         save_patient_report(patient_key, timeline, cross_check, lab_trends=lab_trends)
         out_path = _patient_report_path(patient_key)

@@ -15,8 +15,8 @@ fields already produced by process_document()'s single extraction call, and
 applies cheap, local, deterministic checks on that structure. So the cost of
 filtering is O(1) dict lookups — no extra OCR, no extra OpenAI request, no
 added latency — and it runs *before* the expensive downstream work (timeline
-rebuild, cross-check LLM call, Chroma re-indexing), so a rejected file never
-pays for any of that either.
+rebuild, cross-check LLM call, lab trend tracking, Cloudinary upload), so a
+rejected file never pays for any of that either.
 
 Multilingual documents: this filter never inspects raw document text or
 language — every check below is a presence/type/number check on already-

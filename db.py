@@ -16,6 +16,11 @@ the existing `users` collection already lives in):
     patient_snapshots   one record per user: the last-built patient_timeline
                         + cross_check_report + lab_trends (mirrors what the
                         CLI writes to patient_report_<name>.json).
+    conversation_sessions  one record per (user_id, session_id): the Q&A turn
+                        history plus the conversation's entity focus. Stored
+                        rather than kept in process memory so follow-up
+                        questions survive a restart and work across more than
+                        one API worker.
 
 Env:
     MONGODB_URI   connection string (database name taken from its path)
@@ -31,10 +36,21 @@ from pymongo.collection import Collection
 _client: Optional[MongoClient] = None
 
 
+# pymongo's default server-selection timeout is 30s. That's far too long to
+# block on now that a conversation turn writes here (conversation.py persists
+# the session on every message) — an unreachable database would hang a
+# request rather than fail it. Bounded so callers that treat persistence as
+# best-effort degrade in seconds instead of half a minute.
+SERVER_SELECTION_TIMEOUT_MS = int(os.environ.get("MONGODB_TIMEOUT_MS", "8000"))
+
+
 def _get_db():
     global _client
     if _client is None:
-        _client = MongoClient(os.environ["MONGODB_URI"])
+        _client = MongoClient(
+            os.environ["MONGODB_URI"],
+            serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS,
+        )
     return _client.get_default_database()
 
 
@@ -46,12 +62,20 @@ def _snapshots() -> Collection:
     return _get_db()["patient_snapshots"]
 
 
+def _sessions() -> Collection:
+    return _get_db()["conversation_sessions"]
+
+
 def ensure_indexes() -> None:
     """Called once at API startup. user_id is the access-control boundary
-    for both collections, so both are indexed on it; patient_snapshots is
-    additionally unique per user_id since it's a single materialized view."""
+    for every collection, so all are indexed on it; patient_snapshots is
+    additionally unique per user_id since it's a single materialized view,
+    and conversation_sessions is unique per (user_id, session_id) — the
+    compound key also means a session_id guessed from another user can never
+    match, since the lookup is always scoped by the authenticated user_id."""
     _documents().create_index("user_id")
     _snapshots().create_index("user_id", unique=True)
+    _sessions().create_index([("user_id", 1), ("session_id", 1)], unique=True)
 
 
 def _now_iso() -> str:
@@ -100,3 +124,52 @@ def save_patient_snapshot(
     if lab_trends is not None:
         fields["lab_trends"] = lab_trends
     _snapshots().update_one({"user_id": user_id}, {"$set": fields}, upsert=True)
+
+
+# ---------------------------------------------------------------------------
+# Conversation sessions
+# ---------------------------------------------------------------------------
+
+def load_session(user_id: str, session_id: str) -> Optional[Dict[str, Any]]:
+    """Loads {"turns", "focus"} for one conversation, or None if this user
+    has no such session. Scoped by user_id, so one user's session_id can
+    never read another's conversation."""
+    return _sessions().find_one(
+        {"user_id": user_id, "session_id": session_id}, {"_id": 0}
+    )
+
+
+def save_session(
+    user_id: str,
+    session_id: str,
+    turns: List[Dict[str, Any]],
+    focus: Optional[Dict[str, Any]] = None,
+    summary: Optional[str] = None,
+    summary_covers_up_to: int = 0,
+) -> None:
+    """Upserts a conversation's full turn history and entity focus. The
+    cached summary is stored alongside so a long conversation doesn't have
+    to be re-summarized after a restart."""
+    _sessions().update_one(
+        {"user_id": user_id, "session_id": session_id},
+        {
+            "$set": {
+                "user_id": user_id,
+                "session_id": session_id,
+                "turns": turns,
+                "focus": focus or {},
+                "summary": summary,
+                "summary_covers_up_to": summary_covers_up_to,
+                "updated_at": _now_iso(),
+            },
+            "$setOnInsert": {"created_at": _now_iso()},
+        },
+        upsert=True,
+    )
+
+
+def delete_session(user_id: str, session_id: str) -> bool:
+    """Deletes one conversation. Returns True if a session was removed."""
+    return _sessions().delete_one(
+        {"user_id": user_id, "session_id": session_id}
+    ).deleted_count > 0
