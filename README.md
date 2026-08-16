@@ -241,7 +241,9 @@ still returned and saved.
 
 Errors: `400` no files / unsupported extension, `422` extraction failed for
 a given file, `422` a file extracted successfully but doesn't look like a
-medical document (see below).
+medical document (see below). A document whose extracted identity doesn't
+match this account's other documents is not an error — see "Different-patient
+/ identity mismatch detection" below; the request still returns `201`.
 
 **Non-medical document rejection** — passing the `.pdf`/`.png`/`.jpg` file
 extension check doesn't mean a file *is* a medical document (a boarding
@@ -258,6 +260,99 @@ extraction that already ran:
 
 For multi-page PDFs, each page is checked individually and the page number
 is included in the error (`'file.pdf (page 2)'`).
+
+**Different-patient / identity mismatch detection** — this app is one
+patient per account, so [`identity_guard.py`](identity_guard.py) checks
+each newly-uploaded document's extracted identity (name, age, gender)
+against this account's **document history only** — the identity on
+documents already on file for this user. It deliberately does **not**
+compare against the account holder's registered profile name, since that
+name is set at signup and is often not the patient's own name (a
+caregiver's account, a nickname, a transliteration choice) — using it as
+ground truth produced false positives.
+
+A brand new account has no document history yet, so a first-ever upload is
+only checked against *itself*:
+- If every document in the batch agrees on one patient, none of them are
+  second-guessed, no matter whose name that is.
+- If the batch itself disagrees (e.g. one file says "Ramesh", another says
+  "Suresh", with no prior history for either), the larger name-group in
+  the batch is treated as the baseline and the rest are held for
+  confirmation — the same treatment a mismatch against existing history
+  gets.
+
+Matching rules:
+- **Name** is fuzzy-matched (not exact), since OCR/handwriting reads and
+  transliteration introduce spelling variance a genuine same-person upload
+  shouldn't be penalized for.
+- **Age** is never compared directly (age legitimately differs between
+  documents taken years apart) — each document's `patient_age` is combined
+  with its `date` to estimate a birth year, and birth-year estimates are
+  compared instead, with tolerance for rounding.
+- **Gender**, if present on both sides, is compared directly.
+- No single weak signal holds a document back alone (e.g. one borderline
+  name spelling, or a missing gender field) — it takes either one strong
+  signal or two corroborating weaker signals together. See the named
+  threshold constants at the top of `identity_guard.py` for the exact
+  scoring rule.
+
+**Partial acceptance, not all-or-nothing** — a batch is never fully
+rejected over one mismatched file. Documents that match proceed
+immediately (uploaded to Cloudinary, merged into the timeline, persisted);
+only the documents that don't match are held out of *that* request
+entirely. The response is still `201`, with an added
+`identity_review_needed` field describing what was held and why:
+
+```json
+{
+  "user_id": "6620a1f2...",
+  "documents_added": 1,
+  "documents_total": 3,
+  "timeline": { "...": "reflects only the documents that were added" },
+  "cross_check_report": { "...": "..." },
+  "lab_trends": { "...": "..." },
+  "identity_review_needed": {
+    "error": "patient_name_mismatch",
+    "message": "1 of 2 uploaded document group(s) (Suresh Babu) don't match the patient on your other document(s) and were not added. Confirm to add them anyway, or leave them out.",
+    "known_identity": {
+      "document_patient_names": ["Ramesh Kumar"],
+      "estimated_birth_year": 1975,
+      "gender": "male"
+    },
+    "held_documents": [
+      {
+        "patient_name": "Suresh Babu",
+        "estimated_birth_year": 1995,
+        "gender": "male",
+        "source_files": ["suresh_report.pdf"],
+        "message": "\"Suresh Babu\" doesn't match the patient on your other document(s).",
+        "signals": [
+          {
+            "field": "name",
+            "extracted_value": "Suresh Babu",
+            "known_value": "Ramesh Kumar",
+            "similarity": 0.31,
+            "severity": "strong",
+            "explanation": "\"Suresh Babu\" is only 31% similar to the patient name on your other document(s)."
+          }
+        ],
+        "score": 2,
+        "threshold": 2
+      }
+    ],
+    "documents": [
+      {"label": "ramesh_report.pdf", "patient_name": "Ramesh Kumar"},
+      {"label": "suresh_report.pdf", "patient_name": "Suresh Babu"}
+    ]
+  }
+}
+```
+
+If the held document(s) really do belong to this account, resubmit just
+those file(s) (by name, from `held_documents[].source_files`) with
+`confirm_name_mismatch=true` added to the form data — that request skips
+the check entirely and adds them. There's no need to resend documents that
+already succeeded.
 
 #### `GET /api/v1/timeline`
 
