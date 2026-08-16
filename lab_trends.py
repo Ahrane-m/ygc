@@ -17,6 +17,22 @@ check. The "plain language" explanation is a template filled from those
 computed facts, not a generated summary, so it can't say anything the
 numbers don't support.
 
+WRITTEN FOR THE PATIENT, NOT THE CLINICIAN
+------------------------------------------
+`explanation` is read by whoever uploaded the documents, who generally has
+no medical background — so it avoids the vocabulary a lab report assumes.
+Abbreviations printed on the report ("ALT", "TSH", "eGFR") are spelled out
+via TEST_GLOSSARY, "reference range" becomes "the normal range", a "high"
+flag becomes "higher than the normal range", and readings are listed as
+"91 mg/dL on 05 Jan 2026, then 103 mg/dL on 20 Apr 2026".
+
+The glossary describes only what each test MEASURES, never what a result
+means — "ALT is one of the tests used to check how the liver is working" is
+a description; "a high ALT means liver damage" is a diagnosis this module
+must never make. The precise values, units, ranges and flags stay available
+in the structured fields alongside the text, so nothing is lost for callers
+that need them (retrieval.py renders both).
+
 Dates in this pipeline arrive in wildly inconsistent formats (mixed
 languages, "02-Jan-2020, 03:26 PM" vs "04-07-2019" vs "05 Jan 2026") —
 see the varied `date` fields real extractions produce. dateutil.parser is
@@ -34,6 +50,87 @@ from dateutil import parser as dateutil_parser
 # the boundary it's moving toward, counts as "approaching" that boundary
 # even though it hasn't crossed yet.
 APPROACHING_THRESHOLD_FRACTION = 0.15
+
+# ---------------------------------------------------------------------------
+# Plain-language glossary
+#
+# Lab reports print abbreviations ("ALT", "TSH", "eGFR") that mean nothing to
+# most people reading their own results, so `explanation` below spells out
+# what each test looks at. Keyed by substrings matched against the test name.
+#
+# EVERY ENTRY DESCRIBES WHAT THE TEST MEASURES — NEVER WHAT A RESULT MEANS.
+# "ALT is one of the tests used to check how the liver is working" is a
+# description of the test. "A high ALT means liver damage" is a diagnosis, and
+# would break the promise the rest of this module keeps: that the explanation
+# cannot say anything the extracted numbers support. Nothing here interprets a
+# value, states a cause, or implies a condition.
+#
+# Deliberately not exhaustive. A test that isn't listed simply keeps its
+# printed name with no gloss, which is honest — a wrong gloss on a test we
+# guessed at would be worse than none.
+# ---------------------------------------------------------------------------
+
+TEST_GLOSSARY: List[Tuple[Tuple[str, ...], str, str]] = [
+    (("alt", "sgpt", "ast", "sgot", "ggt", "bilirubin"),
+     "a liver test",
+     "one of the tests used to check how the liver is working"),
+    (("alkaline phosphatase", "alp"),
+     "a liver and bone test",
+     "a test used to check the liver and the bones"),
+    (("creatinine", "egfr", "gfr", "urea", "bun"),
+     "a kidney test",
+     "a test used to check how well the kidneys are filtering the blood"),
+    (("hba1c", "a1c"),
+     "an average blood sugar test",
+     "a test showing the average blood sugar level over roughly the last "
+     "two to three months"),
+    (("glucose",),
+     "a blood sugar test",
+     "a test showing the amount of sugar in the blood"),
+    (("tsh", "thyroid", "t3", "t4"),
+     "a thyroid test",
+     "a test for the thyroid, the gland in the neck that helps control how "
+     "the body uses energy"),
+    (("ldl", "hdl", "cholesterol", "triglyceride", "lipid"),
+     "a cholesterol test",
+     "a test measuring fats in the blood, such as cholesterol"),
+    (("hemoglobin", "haemoglobin", "hgb"),
+     "a blood count test",
+     "a test measuring the part of the red blood cells that carries oxygen "
+     "around the body"),
+    (("hematocrit", "haematocrit", "rbc", "red blood cell"),
+     "a blood count test",
+     "a test measuring the red blood cells, which carry oxygen around the body"),
+    (("wbc", "white blood cell", "leukocyte"),
+     "a blood count test",
+     "a test measuring the white blood cells, which the body uses to fight "
+     "infection"),
+    (("platelet",),
+     "a blood count test",
+     "a test measuring platelets, the part of the blood that helps it clot"),
+    (("inr", "prothrombin", "aptt", "ptt"),
+     "a blood clotting test",
+     "a test measuring how long the blood takes to clot"),
+    (("uric acid", "urate"),
+     "a uric acid test",
+     "a test measuring uric acid, a waste product that the body normally "
+     "passes out in urine"),
+    (("psa",),
+     "a prostate test",
+     "a test measuring a substance made by the prostate gland"),
+    (("troponin", "bnp"),
+     "a heart test",
+     "a test measuring a substance in the blood that comes from the heart"),
+    (("crp", "c-reactive", "esr", "sedimentation"),
+     "an inflammation test",
+     "a test that looks for signs of inflammation somewhere in the body"),
+    (("vitamin d", "vitamin b12", "b12", "folate", "ferritin", "iron"),
+     "a vitamin or mineral test",
+     "a test measuring the level of a vitamin or mineral in the blood"),
+    (("sodium", "potassium", "chloride", "calcium", "magnesium"),
+     "a mineral test",
+     "a test measuring the minerals and salts in the blood"),
+]
 
 # Net change smaller than this fraction of the range width is "stable"
 # rather than a real directional trend (guards against noise/rounding).
@@ -93,6 +190,40 @@ def _flag_sequence_phrase(flags: List[str]) -> str:
     return " → ".join(flags)
 
 
+def _describe_test(test_name: str) -> Tuple[Optional[str], Optional[str]]:
+    """Looks a test name up in TEST_GLOSSARY, returning
+    (short_plain_name, what_it_measures) or (None, None) if it isn't listed.
+
+    Matches on word boundaries so a short key like "alt" doesn't fire on
+    "Cobalt" or "Alkaline Phosphatase", and checks longer keys first so
+    "hba1c" wins over "a1c" and "vitamin b12" over "b12"."""
+    name = (test_name or "").lower()
+    for keywords, plain_name, measures in TEST_GLOSSARY:
+        for kw in sorted(keywords, key=len, reverse=True):
+            if re.search(rf"\b{re.escape(kw)}\b", name):
+                return plain_name, measures
+    return None, None
+
+
+def _plain_direction(direction: str) -> str:
+    """Turns the computed direction into words rather than jargon."""
+    return {
+        "stable": "has stayed about the same",
+        "increasing": "has been going up",
+        "decreasing": "has been going down",
+        "fluctuating (net increasing)": "has moved up and down, but overall it has gone up",
+        "fluctuating (net decreasing)": "has moved up and down, but overall it has gone down",
+    }.get(direction, "has changed")
+
+
+def _plain_flag(flag: str) -> str:
+    """'high'/'low' as a phrase a reader doesn't have to interpret."""
+    return {
+        "high": "higher than the normal range",
+        "low": "lower than the normal range",
+    }.get(flag, "outside the normal range")
+
+
 def _direction(values: List[float], range_bounds: Optional[Tuple[float, float]]) -> str:
     net_change = values[-1] - values[0]
     width = (range_bounds[1] - range_bounds[0]) if range_bounds else max(abs(v) for v in values) or 1.0
@@ -144,39 +275,74 @@ def _explain(
     crossing: Optional[Dict[str, Any]],
     approaching: bool,
 ) -> str:
+    """
+    Writes the trend out in language a reader with no medical background can
+    follow: the test's abbreviation is spelled out, "reference range" becomes
+    "the normal range", flags become "higher than the normal range", and the
+    readings are listed as "X on <date>, then Y on <date>" rather than joined
+    by arrows.
+
+    Still assembled from the computed values only — same guarantee as before,
+    that this text cannot claim anything the numbers don't support. It says
+    what the numbers did; it never says what caused it or what it means for
+    the person, which stays a clinician's call.
+    """
     values = [p["_value"] for p in points]
     dates = [p.get("date") or "an unspecified date" for p in points]
-    trail = " → ".join(f"{v:g} {unit}".strip() + f" ({d})" for v, d in zip(values, dates))
-    net_change = values[-1] - values[0]
-    range_phrase = f" (reference range {range_bounds[0]:g}-{range_bounds[1]:g} {unit})" if range_bounds else ""
+    readings = [f"{v:g} {unit}".strip() + f" on {d}" for v, d in zip(values, dates)]
+    trail = readings[0] + "".join(f", then {r}" for r in readings[1:])
 
-    if direction == "stable":
-        base = (
-            f"{test_name} has stayed roughly stable across {len(points)} tests{range_phrase}: {trail}."
-        )
+    plain_name, measures = _describe_test(test_name)
+    # Lead with the printed name (it's what's on their report), then explain
+    # the abbreviation once, in brackets.
+    if measures:
+        opening = f"{test_name} is {measures}."
     else:
-        verb = "risen" if net_change > 0 else "fallen"
-        base = (
-            f"{test_name} has {verb} across {len(points)} tests{range_phrase}, from {values[0]:g} {unit} "
-            f"to {values[-1]:g} {unit} ({trail})."
+        opening = ""
+
+    movement = _plain_direction(direction)
+    base = (
+        f"{opening} Looking at the {len(points)} times this was tested, the result "
+        f"{movement}: {trail}."
+    ).strip()
+
+    if range_bounds:
+        base += (
+            f" The normal range for this test is {range_bounds[0]:g} to "
+            f"{range_bounds[1]:g} {unit}.".rstrip()
         )
 
     if crossing is not None:
         base += (
-            f" It moved from within the normal range into the '{crossing['flag']}' range "
-            f"starting with the {crossing.get('date', 'most recent')} test, and has stayed there since."
+            f" The result went from inside the normal range to "
+            f"{_plain_flag(crossing['flag'])} at the "
+            f"{crossing.get('date') or 'most recent'} test, and has stayed there since."
         )
     elif points[-1]["flag"] != "normal" and points[0]["flag"] != "normal":
-        base += f" It was already outside the normal range at the earliest available test and has remained '{points[-1]['flag']}'."
-    elif approaching:
         base += (
-            f" It's still within the normal range but has been trending toward the "
-            f"{'upper' if 'increasing' in direction else 'lower'} boundary — worth watching even "
-            "though it hasn't been flagged abnormal yet."
+            f" The result was already {_plain_flag(points[0]['flag'])} at the earliest "
+            f"test on file, and it is still {_plain_flag(points[-1]['flag'])}."
+        )
+    elif approaching:
+        edge = "top" if "increasing" in direction else "bottom"
+        base += (
+            f" The result is still inside the normal range, but it has been moving "
+            f"closer to the {edge} of that range. Nothing here is outside the normal "
+            "range yet — it is just worth keeping an eye on."
         )
     elif direction == "stable":
-        base += " No concerning drift observed."
+        base += " There is no clear change here."
 
+    # The "we can't tell you what this means" caution goes only on results
+    # that are outside the normal range or heading that way — those are the
+    # ones someone might read too much into. Repeating it on every stable,
+    # in-range test would turn a readable list into boilerplate and train the
+    # reader to skip it, which is where it would then be missed.
+    if crossing is not None or approaching or points[-1]["flag"] != "normal":
+        base += (
+            " This only shows what was measured and when — not what caused it or what "
+            "it means. A doctor or pharmacist can explain that."
+        )
     return base
 
 
@@ -190,14 +356,19 @@ def track_lab_trends(timeline: Dict[str, Any]) -> Dict[str, Any]:
       {
         "trends": [
           {
-            "test_name": str, "unit": str, "reference_range": "low-high" | None,
+            "test_name": str,      # exactly as printed on the report
+            "plain_name": str | None,        # e.g. "a kidney test"
+            "what_it_measures": str | None,  # one plain sentence, or None if
+                                             # the test isn't in TEST_GLOSSARY
+            "unit": str, "reference_range": "low-high" | None,
             "data_points": [{"date", "value", "flag", "source_file"}, ...]  # chronological
             "direction": "increasing" | "decreasing" | "stable" | "fluctuating (net increasing/decreasing)",
             "flag_sequence": "normal → normal → high",
             "crossed_into_abnormal_at": {"date":..., "flag":...} | None,
             "approaching_threshold": bool,
             "confidence": float,   # lower if dates/values had to be dropped, or reference ranges disagreed
-            "explanation": str,    # plain-language, template-generated from the numbers above
+            "explanation": str,    # plain-language (no abbreviations or jargon),
+                                   # template-generated from the numbers above
           }, ...
         ],
         "insufficient_data": [{"test_name": str, "reason": str}, ...],
@@ -266,8 +437,14 @@ def track_lab_trends(timeline: Dict[str, Any]) -> Dict[str, Any]:
         if len(units_seen) > 1 or len(ranges_seen) > 1:
             base_confidence *= 0.7
 
+        plain_name, measures = _describe_test(test_name)
+
         trends.append({
             "test_name": test_name,
+            # Both null for a test not in TEST_GLOSSARY — a caller rendering
+            # these should fall back to test_name rather than show "None".
+            "plain_name": plain_name,
+            "what_it_measures": measures,
             "unit": unit,
             "reference_range": usable[-1]["reference_range"],
             "data_points": [
@@ -288,15 +465,26 @@ def track_lab_trends(timeline: Dict[str, Any]) -> Dict[str, Any]:
         "trends": trends,
         "insufficient_data": insufficient,
         "note": (
-            "This trend analysis is computed directly from the extracted lab values and reference "
-            "ranges — it is not a diagnosis and does not account for clinical context beyond the "
-            "numbers shown. Consult the patient's doctor or a pharmacist to interpret what any trend "
-            "means for their care."
+            "This is worked out directly from the numbers printed on the uploaded lab "
+            "reports and the normal ranges printed alongside them. It shows how results "
+            "have changed over time — it does not say what caused a change, and it is not "
+            "a diagnosis. It also cannot see anything your reports don't show, such as how "
+            "you are feeling or any other health condition. A doctor or pharmacist can "
+            "explain what these results mean for you."
         ),
     }
 
 
 if __name__ == "__main__":
+    import sys
+
+    # flag_sequence is joined with "→", which a cp1252 console (the Windows
+    # default, and what Git Bash uses here) cannot encode — the self-test
+    # would die printing its own results rather than on a failed assertion.
+    # Same guard inspect_records.py and the extractor CLI use.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     # Self-test using John's three real lab reports from this project's
     # test data: Fasting Glucose drifts from normal into high, ALT jumps
     # into high only at the last test, Creatinine rises but stays just
@@ -328,8 +516,32 @@ if __name__ == "__main__":
     assert by_name["Creatinine"]["approaching_threshold"] is True
 
     # Regression check for the reference-range parsing bug (hyphen
-    # mis-read as a negative sign): must render as "70-99", not "-99-70".
-    assert "70-99 mg/dL" in by_name["Fasting Glucose"]["explanation"], by_name["Fasting Glucose"]["explanation"]
+    # mis-read as a negative sign): must render as 70 to 99, not -99 to 70.
+    assert "70 to 99 mg/dL" in by_name["Fasting Glucose"]["explanation"], \
+        by_name["Fasting Glucose"]["explanation"]
+
+    # Plain-language checks: abbreviations are spelled out, lab-report jargon
+    # is gone, and the readings read as sentences rather than arrow trails.
+    glucose_explanation = by_name["Fasting Glucose"]["explanation"]
+    assert "amount of sugar in the blood" in glucose_explanation, glucose_explanation
+    assert "91 mg/dL on 05 Jan 2026" in glucose_explanation, glucose_explanation
+    assert "higher than the normal range" in glucose_explanation, glucose_explanation
+    assert by_name["ALT"]["plain_name"] == "a liver test"
+    assert "liver" in by_name["ALT"]["explanation"]
+    assert by_name["Creatinine"]["plain_name"] == "a kidney test"
+
+    for trend in result["trends"]:
+        text = trend["explanation"]
+        for jargon in ("reference range", "abnormal", "boundary", "flagged",
+                       "drift", "→"):
+            assert jargon not in text, f"{trend['test_name']}: leaked '{jargon}' -> {text}"
+
+    # The glossary must not fire on unrelated names that merely contain a key
+    # as a substring, and longer keys must win over shorter ones.
+    assert _describe_test("Cobalt") == (None, None)
+    assert _describe_test("Vitamin B12")[0] == "a vitamin or mineral test"
+    assert _describe_test("HbA1c")[0] == "an average blood sugar test"
+    assert _describe_test("Some Unlisted Assay") == (None, None)
 
     # Regression check for the "fluctuating (net increasing)" boundary-wording
     # bug: direction.startswith("increasing") used to miss this case (it starts
@@ -346,8 +558,8 @@ if __name__ == "__main__":
     glucose_trend = fluctuating_result["trends"][0]
     assert glucose_trend["direction"] == "fluctuating (net increasing)", glucose_trend["direction"]
     assert glucose_trend["approaching_threshold"] is True
-    assert "upper boundary" in glucose_trend["explanation"], glucose_trend["explanation"]
-    assert "lower boundary" not in glucose_trend["explanation"], glucose_trend["explanation"]
+    assert "top of that range" in glucose_trend["explanation"], glucose_trend["explanation"]
+    assert "bottom of that range" not in glucose_trend["explanation"], glucose_trend["explanation"]
 
     for t in result["trends"]:
         print(f"--- {t['test_name']} ---")

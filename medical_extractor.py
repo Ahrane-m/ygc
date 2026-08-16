@@ -98,6 +98,67 @@ the same regardless of what language or units each was printed in:
   into the medication's confidence the same way an inferred brand-to-
   generic mapping is.
 
+TWO SEPARATE CONFIDENCE AXES — ocr_confidence and translation_confidence
+are independent risks and must be scored independently. Do not copy one
+into the other, and do not average them into either.
+
+- ocr_confidence: how well you could READ the characters off the page.
+  This is about legibility ONLY — print quality, handwriting, blur, skew,
+  glare, cut-off edges, resolution. A crisply printed document scores high
+  here no matter what language it is in. A blurry or handwritten one scores
+  low no matter how simple its content.
+  - 0.90-1.00: clean printed text, everything legible.
+  - 0.60-0.89: readable but with effort — some handwriting, mild blur, a
+    partially cut-off table, faint print.
+  - Below 0.60: substantially illegible, guessed characters, heavy glare or
+    handwriting you are unsure of.
+
+- translation_confidence: how confident you are that the NORMALIZED English
+  fields (each medication's `ingredients`, plus dosage_value/dosage_unit/
+  frequency_per_day) faithfully represent what the document actually says.
+  This is about the conversion step, NOT about legibility.
+  - 1.00: nothing needed converting — the document is already in English and
+    printed generic (INN) drug names directly, with plain metric doses.
+  - 0.90-1.00: a routine, unambiguous conversion — a well-known brand name
+    mapped to its generic, "cada 8 horas" -> 3/day, "0.5 g" -> 500 mg.
+  - 0.60-0.89: a conversion you are reasonably but not fully sure of — a
+    transliterated drug name, a regional brand you know less well, a
+    frequency phrase that could be read more than one way.
+  - Below 0.60: you are guessing at a drug's identity or its dose, the name
+    transliterates ambiguously, or you could not confidently map it at all.
+  - Use null ONLY when there was nothing to convert AND nothing to check —
+    i.e. the document contains no medications at all. A document with
+    medications always gets a number.
+
+Score these honestly and independently: a sharply printed Japanese
+prescription should have HIGH ocr_confidence and a LOWER
+translation_confidence, while a blurry handwritten English note should have
+LOW ocr_confidence and a HIGH translation_confidence. Collapsing them hides
+which of the two actually went wrong, and they have different fixes —
+a bad read needs a better scan, a bad conversion needs a pharmacist to
+confirm the generic name.
+
+overall_confidence remains your single blended judgment for the document as
+a whole, as described elsewhere in these rules.
+
+LANGUAGE REPORTING — downstream code depends on the normalization above
+having actually happened, so report what you saw:
+- document_language: the main language the document is PRINTED in, as its
+  English name ("English", "Tamil", "Sinhala", "Spanish", "Japanese",
+  "Arabic", ...). Use null ONLY if the document has too little legible text
+  to tell — never guess.
+- additional_languages: any OTHER languages also printed on the same
+  document, as English names. Mixed-language documents are common (e.g. a
+  prescription with English drug names and Sinhala dosage instructions);
+  list every additional language you actually see, or an empty array if the
+  document is in one language throughout. Do not list the same language
+  twice, and do not repeat document_language here.
+- Reporting a language does NOT change how you extract. ingredients must
+  still be the English INN, and dosage_value/frequency_per_day must still be
+  normalized, exactly as described above — these fields exist so a reviewer
+  can tell which language the source was in, not to excuse leaving a field
+  in its original language.
+
 PATIENT IDENTITY FIELDS — patient_age and patient_gender exist so
 downstream code can detect when a document was filed under the wrong
 person's account (e.g. a family member's prescription mistakenly uploaded
@@ -139,6 +200,8 @@ EXTRACTION_JSON_SCHEMA = {
             "enum": ["prescription", "lab_report", "discharge_summary", "other"],
         },
         "date": {"type": ["string", "null"]},
+        "document_language": {"type": ["string", "null"]},
+        "additional_languages": {"type": "array", "items": {"type": "string"}},
         "provider_or_doctor": {"type": ["string", "null"]},
         "patient_name": {"type": ["string", "null"]},
         "patient_age": {"type": ["integer", "null"]},
@@ -190,12 +253,16 @@ EXTRACTION_JSON_SCHEMA = {
         "clinical_notes": {"type": ["string", "null"]},
         "illegible_or_low_confidence_fields": {"type": "array", "items": {"type": "string"}},
         "overall_confidence": {"type": "number"},
+        "ocr_confidence": {"type": "number"},
+        "translation_confidence": {"type": ["number", "null"]},
     },
     "required": [
-        "document_type", "date", "provider_or_doctor", "patient_name",
+        "document_type", "date", "document_language", "additional_languages",
+        "provider_or_doctor", "patient_name",
         "patient_age", "patient_gender",
         "medications", "lab_results", "allergies_noted", "clinical_notes",
         "illegible_or_low_confidence_fields", "overall_confidence",
+        "ocr_confidence", "translation_confidence",
     ],
     "additionalProperties": False,
 }
@@ -318,9 +385,20 @@ def _apply_confidence_ceiling(result: Dict[str, Any], ceiling: float) -> Dict[st
     can't outrank what the extraction method itself can actually support.
     Text-layer (text_layer) extractions are left uncapped since those come
     from a digital text source, not a visual read.
+
+    translation_confidence is deliberately NOT capped here. The ceiling
+    encodes a limit on READING characters off an image, which is exactly what
+    ocr_confidence measures; correctly translating a word that was read
+    correctly is not made less certain by the page having been photographed.
+    The two do interact — you cannot translate what you misread — but that
+    coupling belongs in the risk assessment that combines them
+    (language_guard.assess_translation_risk), not in a silent cap that would
+    make a genuinely independent measurement look like a dependent one.
     """
     if "overall_confidence" in result and isinstance(result["overall_confidence"], (int, float)):
         result["overall_confidence"] = min(result["overall_confidence"], ceiling)
+    if isinstance(result.get("ocr_confidence"), (int, float)):
+        result["ocr_confidence"] = min(result["ocr_confidence"], ceiling)
     for med in result.get("medications", []) or []:
         if isinstance(med.get("confidence"), (int, float)):
             med["confidence"] = min(med["confidence"], ceiling)
@@ -580,6 +658,14 @@ def build_patient_timeline(raw_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     docs = _flatten_documents(raw_results)
 
+    # Tag documents that record the SAME physical prescription (a scan and a
+    # photo of one page, the same file re-sent). Nothing is dropped — the tag
+    # exists so duplicate detection below counts prescriptions rather than
+    # files. Without it, one prescription uploaded twice makes every drug on
+    # it look prescribed twice. See document_dedup.py.
+    from document_dedup import annotate_prescription_groups
+    annotate_prescription_groups(docs)
+
     # Sort by date; undated docs go to the end
     def sort_key(d):
         return d.get("date") or "9999-99-99"
@@ -595,7 +681,12 @@ def build_patient_timeline(raw_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         source_file = d.get("_source", {}).get("file")
 
         for med in d.get("medications", []):
-            all_medications.append({**med, "date": visit_date, "source_file": source_file})
+            all_medications.append({
+                **med,
+                "date": visit_date,
+                "source_file": source_file,
+                "prescription_group": d.get("prescription_group"),
+            })
 
         for lab in d.get("lab_results", []):
             all_lab_results.append({**lab, "date": visit_date, "source_file": source_file})
@@ -670,6 +761,16 @@ default to a high score:
   would be the more dangerous error, and mark it clearly as low-confidence.
 
 Rules:
+- Every medication entry carries a `prescription_group`. Entries sharing a
+  prescription_group came from THE SAME physical prescription, uploaded more
+  than once (a scan and a phone photo of one page, the same file re-sent).
+  They are one prescription, not several. NEVER report a duplicate, a dosage
+  conflict, or an interaction between entries that share a
+  prescription_group — a drug does not interact with itself, and the same
+  page filed twice is not a double dose. Only compare ACROSS different
+  prescription_group values. Note that the printed `date` and `source_file`
+  can differ between entries in one group (the same date is often extracted
+  in different formats); prescription_group is the authority, not those.
 - Compare medications by their active ingredients (not just brand names) —
   two different brand names with the same active ingredient is a likely
   duplicate.
@@ -826,9 +927,19 @@ def detect_exact_duplicate_medications(timeline: Dict[str, Any]) -> List[Dict[st
 
     duplicates: List[Dict[str, Any]] = []
     for (ingredients, dosage_value, dosage_unit), meds in groups.items():
-        distinct_sources = {(m.get("date"), m.get("source_file")) for m in meds}
-        if len(distinct_sources) < 2:
-            continue  # same medication appearing once is not a duplicate
+        # Counted by PRESCRIPTION, not by file. One prescription uploaded as
+        # both a scan and a phone photo yields two (date, source_file) pairs
+        # for every drug on it, which the old check read as "prescribed
+        # twice" — reporting a double-dosing risk that came from the upload
+        # history rather than the patient's medication history. Documents
+        # recording the same prescription share a prescription_group (see
+        # document_dedup.py), so they collapse to one here.
+        distinct_prescriptions = {
+            m.get("prescription_group") or (m.get("date"), m.get("source_file"))
+            for m in meds
+        }
+        if len(distinct_prescriptions) < 2:
+            continue  # same medication on one prescription is not a duplicate
         duplicates.append({
             "medication": " / ".join(ingredients),
             "occurrences": [
@@ -837,16 +948,24 @@ def detect_exact_duplicate_medications(timeline: Dict[str, Any]) -> List[Dict[st
             ],
             "explanation": (
                 f"Deterministic check: identical active ingredient(s) ({', '.join(ingredients)}) "
-                f"at the same normalized dose ({dosage_value} {dosage_unit}) appear in "
-                f"{len(distinct_sources)} separate documents, regardless of source language or "
-                "printed wording."
+                f"at the same normalized dose ({dosage_value} {dosage_unit}) appear on "
+                f"{len(distinct_prescriptions)} separate prescriptions, regardless of source "
+                "language or printed wording."
             ),
             "confidence": 0.95,  # exact numeric/ingredient match, not model inference
+            # Marks this as computed, not recalled — evidence_grading.py keeps
+            # it uncapped on the strength of this, while model-authored
+            # findings in the same list are capped.
+            "evidence_source": "deterministic",
         })
     return duplicates
 
 
-def cross_check_prescriptions(timeline: Dict[str, Any], model: str = MODEL) -> Dict[str, Any]:
+def cross_check_prescriptions(
+    timeline: Dict[str, Any],
+    model: str = MODEL,
+    graph_backed_findings: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """
     Runs interaction / duplicate / dosage-conflict / allergy cross-checking
     over a patient's merged medication timeline (output of
@@ -883,6 +1002,16 @@ def cross_check_prescriptions(timeline: Dict[str, Any], model: str = MODEL) -> D
         dup_sources = frozenset((occ["date"], occ["source_file"]) for occ in dup["occurrences"])
         if dup_sources not in existing_source_sets:
             existing.append(dup)
+
+    # Grade every finding by what actually backs it. The model scores its own
+    # findings, and it scores a verifiable arithmetic fact and a half-recalled
+    # pharmacology claim on the same scale — so an ungrounded interaction can
+    # arrive at 0.95 and outrank a duplicate that was genuinely computed.
+    # Grading caps and flags the ungrounded ones, which is what this pipeline
+    # already tells users it is (a reasoning layer, not a validated
+    # drug-interaction database).
+    from evidence_grading import grade_cross_check
+    grade_cross_check(result, graph_backed_findings)
 
     return result
 
@@ -950,12 +1079,14 @@ def save_patient_report(
     timeline: Dict[str, Any],
     cross_check: Dict[str, Any],
     lab_trends: Optional[Dict[str, Any]] = None,
+    consult_triage: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Writes the merged timeline + cross-check report (+ optional lab
-    trend analysis) to disk — same shape and naming convention the CLI
-    __main__ flow has always used. `lab_trends` is optional so callers
-    (and old saved reports on disk, loaded back via load_patient_report())
-    that predate lab trend tracking keep working unchanged."""
+    trend analysis and consultation triage) to disk — same shape and naming
+    convention the CLI __main__ flow has always used. `lab_trends` and
+    `consult_triage` are optional so callers (and old saved reports on disk,
+    loaded back via load_patient_report()) that predate those stages keep
+    working unchanged."""
     output = {
         "patient_key": patient_key,
         "patient_timeline": timeline,
@@ -963,6 +1094,8 @@ def save_patient_report(
     }
     if lab_trends is not None:
         output["lab_trends"] = lab_trends
+    if consult_triage is not None:
+        output["consult_triage"] = consult_triage
     with open(_patient_report_path(patient_key), "w") as f:
         json.dump(output, f, indent=2)
 
@@ -973,6 +1106,15 @@ def save_patient_report(
 
 if __name__ == "__main__":
     import sys
+
+    # This CLI prints medication and lab-test names straight from the
+    # extraction, and those keep their original language (only `ingredients`
+    # is normalized to English) — so a Japanese or Tamil drug name reaches
+    # stdout verbatim. A Windows console defaults to cp1252 and would raise
+    # UnicodeEncodeError partway through the run, after the OpenAI calls were
+    # already paid for. Same guard inspect_records.py uses.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     if len(sys.argv) < 2:
         print("Usage:")
@@ -1010,6 +1152,36 @@ if __name__ == "__main__":
         print("No documents were successfully extracted. Exiting.")
         sys.exit(1)
 
+    # Step 1b: drop documents whose language could not be normalized into the
+    # English fields cross-document matching relies on. Reported per file and
+    # skipped rather than aborting the run — unlike the API's single-upload
+    # request, a folder run should still process the other documents, and the
+    # message names exactly which file to re-scan.
+    from language_guard import assert_supported_language, UnsupportedLanguageError
+
+    checked_results = []
+    language_rejected = 0
+    for doc in _flatten_documents(all_results):
+        label = (doc.get("_source") or {}).get("file") or "unknown file"
+        try:
+            assert_supported_language(doc, label)
+        except UnsupportedLanguageError as e:
+            language_rejected += 1
+            print(f"  SKIPPED {label}: {e.reason}")
+            for problem in e.problems:
+                print(f"    - {problem}")
+            continue
+        checked_results.append(doc)
+
+    if language_rejected:
+        print(f"  {language_rejected} document(s) skipped over unresolved language.")
+
+    if not checked_results:
+        print("No documents remained after the language check. Exiting.")
+        sys.exit(1)
+
+    all_results = checked_results
+
     # Step 2: split by patient name, dropping demo/placeholder documents.
     # This stops unrelated prescriptions (e.g. sample docs for different
     # people sitting in the same folder) from being merged into one
@@ -1035,13 +1207,20 @@ if __name__ == "__main__":
         from lab_trends import track_lab_trends
         lab_trends = track_lab_trends(timeline)
 
+        print("Routing findings to a pharmacist/doctor ...")
+        from consult_triage import triage_consultation
+        triage = triage_consultation(cross_check, lab_trends, timeline)
+
         # Persist raw docs too (not just the merged report) so a later API
         # upload for this same patient can merge new documents in. Saving the
         # report is also what makes this patient answerable via --chat:
         # retrieval.py reads the saved report directly, so there is no
         # separate index to build.
         save_patient_documents(patient_key, docs)
-        save_patient_report(patient_key, timeline, cross_check, lab_trends=lab_trends)
+        save_patient_report(
+            patient_key, timeline, cross_check,
+            lab_trends=lab_trends, consult_triage=triage,
+        )
         out_path = _patient_report_path(patient_key)
 
         print(f"Saved report to {out_path}")
@@ -1050,6 +1229,16 @@ if __name__ == "__main__":
         print(f"  Interaction flags: {len(cross_check.get('potential_drug_interactions', []))}")
         print(f"  Duplicate flags: {len(cross_check.get('duplicate_prescriptions', []))}")
         print(f"  Dosage conflict flags: {len(cross_check.get('conflicting_dosage_instructions', []))}")
+
+        if triage["consult_needed"]:
+            print(
+                f"  CONSULT: {triage['consult_type']} ({triage['urgency']}, "
+                f"confidence {triage['confidence']})"
+            )
+            for specialty in triage["recommended_specialties"]:
+                print(f"    - {specialty['specialty']} (for: {', '.join(specialty['triggered_by'])})")
+        else:
+            print("  CONSULT: no automated trigger found (not a clean bill of health)")
 
     # Step 5 (optional): interactive Q&A over whatever was just indexed.
     if chat_mode:
