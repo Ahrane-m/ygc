@@ -14,8 +14,9 @@ the existing `users` collection already lives in):
                         Cloudinary document_url — no raw file bytes, no
                         OpenAI request/response payloads, no access tokens.
     patient_snapshots   one record per user: the last-built patient_timeline
-                        + cross_check_report + lab_trends (mirrors what the
-                        CLI writes to patient_report_<name>.json).
+                        + cross_check_report + lab_trends + consult_triage
+                        (mirrors what the CLI writes to
+                        patient_report_<name>.json).
     conversation_sessions  one record per (user_id, session_id): the Q&A turn
                         history plus the conversation's entity focus. Stored
                         rather than kept in process memory so follow-up
@@ -112,9 +113,10 @@ def save_patient_snapshot(
     timeline: Dict[str, Any],
     cross_check: Dict[str, Any],
     lab_trends: Optional[Dict[str, Any]] = None,
+    consult_triage: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Upserts the merged timeline + cross-check report (+ lab trends, if
-    computed) for this user."""
+    """Upserts the merged timeline + cross-check report (+ lab trends and
+    consultation triage, if computed) for this user."""
     fields: Dict[str, Any] = {
         "user_id": user_id,
         "patient_timeline": timeline,
@@ -123,6 +125,8 @@ def save_patient_snapshot(
     }
     if lab_trends is not None:
         fields["lab_trends"] = lab_trends
+    if consult_triage is not None:
+        fields["consult_triage"] = consult_triage
     _snapshots().update_one({"user_id": user_id}, {"$set": fields}, upsert=True)
 
 

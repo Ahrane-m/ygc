@@ -31,12 +31,16 @@ Usage:
     lookup_antidote_reference("naloxone")                   # single-drug wrapper
 """
 
+import logging
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 import pdfplumber
 
-from graph_db import database_name, get_driver
+from graph_db import run_read, run_write, session_scope
+
+logger = logging.getLogger("poisoning_kg")
 
 SECTION_HEADING_RE = re.compile(
     r"^\d+\.\s*ANTIDOTES AND OTHER SUBSTANCES USED IN POISONINGS",
@@ -109,10 +113,35 @@ def extract_antidote_section(pdf_path: str) -> Dict[str, Any]:
     # between the Section 4 heading and the next top-level heading.
     in_section = False
 
+    # Logged step by step because this runs BEFORE Neo4j is touched: when an
+    # ingest loads zero entries, these lines are what separate "the PDF has no
+    # antidote section" from "the section was found but its tables didn't
+    # parse" — two failures that look identical from the graph's side.
+    logger.info("extract: opening '%s'", pdf_path)
+    started = time.perf_counter()
+
     with pdfplumber.open(pdf_path) as pdf:
         population = _detect_population(pdf)
-        for page_index in _find_section_pages(pdf):
+        logger.info(
+            "extract: '%s' has %d page(s), population=%s",
+            pdf_path, len(pdf.pages), population,
+        )
+
+        section_pages = _find_section_pages(pdf)
+        if not section_pages:
+            logger.warning(
+                "extract: no 'Antidotes and other substances used in poisonings' "
+                "section heading found in '%s' — nothing to ingest", pdf_path,
+            )
+        else:
+            logger.info(
+                "extract: antidote section spans page(s) %s",
+                ", ".join(str(p + 1) for p in section_pages),
+            )
+
+        for page_index in section_pages:
             page = pdf.pages[page_index]
+            entries_before = len(entries)
             for table in page.extract_tables() or []:
                 for row in table:
                     cells = [_clean(c or "") for c in row]
@@ -133,9 +162,21 @@ def extract_antidote_section(pdf_path: str) -> Dict[str, Any]:
                         sub_match = SUBSECTION_RE.match(marker)
                         if sub_match:
                             subsection = sub_match.group(1).lower().replace("-", "_")
+                            # Positive parse milestones: these markers decide
+                            # how every row after them is categorised, so
+                            # seeing them fire is how you confirm entries were
+                            # filed under the right subsection/list.
+                            logger.debug(
+                                "extract: entered subsection '%s' on page %d",
+                                subsection, page.page_number,
+                            )
                             continue
                         if marker.lower() == "complementary list":
                             list_type = "complementary"
+                            logger.debug(
+                                "extract: switched to complementary list on page %d",
+                                page.page_number,
+                            )
                             continue
                         continue
 
@@ -150,6 +191,25 @@ def extract_antidote_section(pdf_path: str) -> Dict[str, Any]:
                         "list_type": list_type,
                         "source_page": page.page_number,
                     })
+                    # Every successfully parsed row, at DEBUG — the per-page
+                    # counts below are the INFO-level summary of these.
+                    logger.debug(
+                        "extract: + %s (%s) [%s/%s] p%d",
+                        name, dosage_form or "no dosage form", subsection or "uncategorised",
+                        list_type, page.page_number,
+                    )
+
+            logger.info(
+                "extract: page %d yielded %d entrie(s)",
+                page.page_number, len(entries) - entries_before,
+            )
+
+    categories = sorted({e["subsection"] for e in entries if e["subsection"]})
+    logger.info(
+        "extract: '%s' done in %.0fms — %d entrie(s), population=%s, categories=%s",
+        pdf_path, (time.perf_counter() - started) * 1000, len(entries), population,
+        categories or "none",
+    )
     return {"population": population, "entries": entries}
 
 
@@ -163,9 +223,25 @@ def ingest_antidote_entries(section: Dict[str, Any], source_document: str) -> in
     """
     entries = section["entries"]
     if not entries:
+        # Logged rather than returning quietly: a zero-entry ingest means the
+        # PDF parse found nothing, and without this line the graph simply
+        # looks unchanged for no stated reason.
+        logger.warning(
+            "ingest: '%s' has 0 entrie(s) — skipping Neo4j write entirely",
+            source_document,
+        )
         return 0
-    with get_driver().session(database=database_name()) as session:
-        session.run(
+
+    logger.info(
+        "ingest: preparing to write %d entrie(s) from '%s' (population=%s) to Neo4j",
+        len(entries), source_document, section["population"],
+    )
+
+    with session_scope("ingest_antidote_entries") as session:
+        summary = run_write(
+            session,
+            "ingest_antidote_entries",
+            f"MERGE {len(entries)} listing(s) for '{source_document}'",
             """
             MERGE (s:SourceDocument {filename: $source_document})
               SET s.population = $population
@@ -185,6 +261,30 @@ def ingest_antidote_entries(section: Dict[str, Any], source_document: str) -> in
             source_document=source_document,
             population=section["population"],
         )
+
+    # The load is MERGE-based and idempotent, so BOTH outcomes are successes
+    # and both are stated plainly: a first load creates nodes, a re-ingest
+    # creates nothing and updates in place. Logging only the second would
+    # make the normal re-ingest look like a silent failure; logging only the
+    # first would leave a successful fresh load unremarked.
+    counters = getattr(summary, "counters", None)
+    if counters is None:
+        pass
+    elif counters.nodes_created or counters.relationships_created:
+        logger.info(
+            "ingest: '%s' loaded successfully — created %d node(s) and %d "
+            "relationship(s), set %d propert(ies)",
+            source_document, counters.nodes_created, counters.relationships_created,
+            counters.properties_set,
+        )
+    else:
+        logger.info(
+            "ingest: '%s' loaded successfully — created no new nodes or relationships "
+            "because this document was already in the graph; %d propert(ies) updated "
+            "in place",
+            source_document, counters.properties_set,
+        )
+    logger.info("ingest: '%s' complete — %d entrie(s) submitted", source_document, len(entries))
     return len(entries)
 
 
@@ -201,9 +301,19 @@ def lookup_antidote_references(drug_names: List[str]) -> Dict[str, Dict[str, Any
     """
     names = [n for n in drug_names if n]
     if not names:
+        # No query is sent at all. Logged because api.py treats an empty
+        # result and an unreachable graph identically — this line marks which
+        # of the two happened.
+        logger.info("lookup: no drug names supplied — no Neo4j query sent")
         return {}
-    with get_driver().session(database=database_name()) as session:
-        records = session.run(
+
+    logger.info("lookup: checking %d drug name(s) against the antidote graph", len(names))
+
+    with session_scope("lookup_antidote_references") as session:
+        records = run_read(
+            session,
+            "lookup_antidote_references",
+            f"match {len(names)} medicine name(s)",
             """
             UNWIND $names AS wanted
             MATCH (m:Medicine {name: toLower(wanted)})-[l:LISTED_IN]->(s:SourceDocument)
@@ -214,7 +324,7 @@ def lookup_antidote_references(drug_names: List[str]) -> Dict[str, Dict[str, Any
             ORDER BY wanted, s.population
             """,
             names=names,
-        ).data()
+        )
 
     found: Dict[str, Dict[str, Any]] = {}
     for r in records:
@@ -225,6 +335,29 @@ def lookup_antidote_references(drug_names: List[str]) -> Dict[str, Dict[str, Any
         })
         entry["listings"].append(
             {k: r[k] for k in ("population", "source_document", "list_type", "dosage_form")}
+        )
+
+    if found:
+        logger.info(
+            "lookup: %d of %d drug name(s) are listed as antidotes: %s",
+            len(found), len(names), ", ".join(sorted(found)),
+        )
+        # Each hit spelled out, at DEBUG. A drug listed in both the adult EML
+        # and the children's EMLc returns two listings, and this is where you
+        # confirm both came back rather than whichever was ingested last.
+        for wanted, ref in sorted(found.items()):
+            for listing in ref["listings"]:
+                logger.debug(
+                    "lookup:   %s -> %s [%s] %s (%s)",
+                    wanted, ref["display_name"], listing["population"],
+                    listing["dosage_form"] or "no dosage form",
+                    listing["source_document"],
+                )
+    else:
+        logger.info(
+            "lookup: none of the %d drug name(s) are listed in the antidote graph "
+            "(the graph was reached — this is a genuine no-match, not a failure)",
+            len(names),
         )
     return found
 

@@ -35,6 +35,7 @@ Env:
     CLOUDINARY_API_SECRET, JWT_SECRET
 """
 
+import hashlib
 import logging
 import os
 import uuid
@@ -51,8 +52,15 @@ import db
 import graph_db
 import storage
 from auth import get_current_user
+from consult_triage import triage_consultation
 from document_filter import NonMedicalDocumentError, assert_medical_document
+from evidence_grading import graph_backed_findings_from_antidotes
 from identity_guard import partition_identity_mismatch
+from language_guard import (
+    UnsupportedLanguageError,
+    assert_supported_language,
+    assess_documents_translation_risk,
+)
 from lab_trends import track_lab_trends
 from medical_extractor import (
     _is_demo_document,
@@ -104,9 +112,14 @@ def _startup() -> None:
     # place Neo4j could take the whole service down.
     try:
         graph_db.ensure_constraints()
+        logger.info("startup: antidote reference graph ready")
     except Exception as e:
+        # graph_db has already logged the failing step and the (redacted) URI;
+        # this line records the consequence — the service runs without the
+        # graph, so every later antidote lookup will find nothing.
         logger.warning(
-            "startup: antidote reference graph unavailable, continuing without it: %s", e,
+            "startup: antidote reference graph unavailable, continuing without it "
+            "(antidote reference notes will be empty on every upload): %s", e,
         )
 
 
@@ -171,6 +184,14 @@ async def upload_documents(
     per_file_pages: List[Tuple[Path, str, List[Tuple[str, Dict[str, Any]]]]] = []
     new_docs: List[Dict[str, Any]] = []
 
+    # Loaded up front (rather than after the loop, where it used to be) so an
+    # already-uploaded file can be recognised BEFORE it is extracted.
+    existing_docs = db.load_documents(user_id)
+    seen_hashes = {
+        d["content_sha256"]: d for d in existing_docs if d.get("content_sha256")
+    }
+    duplicate_files_skipped: List[Dict[str, Any]] = []
+
     with TemporaryDirectory() as tmp_dir:
         for upload in files:
             suffix = Path(upload.filename or "").suffix.lower()
@@ -187,9 +208,46 @@ async def upload_documents(
             tmp_path = Path(tmp_dir) / upload.filename
             content = await upload.read()
             tmp_path.write_bytes(content)
+
+            # Re-uploading a file this user already sent used to add a SECOND
+            # copy of the same document: Cloudinary public_ids carry a random
+            # suffix, so nothing upstream noticed, and the timeline ended up
+            # holding one physical prescription two or three times. The
+            # consequences were clinical, not cosmetic — every medication on
+            # it then appeared under multiple (date, source_file) pairs, which
+            # is exactly the shape detect_exact_duplicate_medications() and
+            # the cross-check LLM both read as "prescribed twice", so the
+            # patient was told to see a pharmacist about a double-dosing risk
+            # that only existed because they uploaded the same photo twice.
+            #
+            # Checked BEFORE extraction, so a re-upload costs no vision call.
+            content_sha256 = hashlib.sha256(content).hexdigest()
+            already = seen_hashes.get(content_sha256)
+            if already is not None:
+                first_seen = already.get("uploaded_at") or "an earlier upload"
+                logger.info(
+                    "upload_documents: user=%s skipping '%s' — identical file already "
+                    "on file as '%s' (uploaded %s, sha256=%s)",
+                    user_id, upload.filename,
+                    (already.get("_source") or {}).get("file", "unknown"),
+                    first_seen, content_sha256[:12],
+                )
+                duplicate_files_skipped.append({
+                    "filename": upload.filename,
+                    "reason": "identical_file_already_uploaded",
+                    "previously_uploaded_as": (already.get("_source") or {}).get("file"),
+                    "previously_uploaded_at": already.get("uploaded_at"),
+                    "message": (
+                        f"'{upload.filename}' is byte-for-byte identical to a document "
+                        "already in your records, so it was not added again. Nothing was "
+                        "lost — the existing copy is still there."
+                    ),
+                })
+                continue
+
             logger.info(
-                "upload_documents: user=%s processing '%s' (%d bytes)",
-                user_id, upload.filename, len(content),
+                "upload_documents: user=%s processing '%s' (%d bytes, sha256=%s)",
+                user_id, upload.filename, len(content), content_sha256[:12],
             )
             try:
                 result = process_document(str(tmp_path))
@@ -230,19 +288,66 @@ async def upload_documents(
                         "upload_documents: user=%s rejected '%s': %s", user_id, label, e.reason,
                     )
                     raise HTTPException(422, str(e))
+
+                # Reject a document whose language could not be normalized
+                # into the English fields cross-document matching depends on.
+                # Accepting it would leave its medications unmatchable
+                # against the rest of the record — a silent gap in the very
+                # cross-check the upload exists to feed, so it fails loudly
+                # here instead.
+                try:
+                    assert_supported_language(page, label)
+                except UnsupportedLanguageError as e:
+                    logger.warning(
+                        "upload_documents: user=%s rejected '%s' (language=%s): %s",
+                        user_id, label, e.detected_language, "; ".join(e.problems),
+                    )
+                    raise HTTPException(422, str(e))
+
+                # Stored so a later upload of this same file is recognised.
+                # Every page of a multi-page PDF carries its parent file's
+                # hash — the unit of re-upload is the file, not the page.
+                page["content_sha256"] = content_sha256
                 kept_pages.append((label, page))
 
             if kept_pages:
                 per_file_pages.append((tmp_path, upload.filename, kept_pages))
+                # Also guards against the same file appearing twice within a
+                # SINGLE batch, which the stored-document check alone can't
+                # see because nothing has been written yet.
+                seen_hashes[content_sha256] = {
+                    "_source": {"file": upload.filename},
+                    "uploaded_at": None,
+                }
 
         if not per_file_pages:
+            # Every file being a known duplicate is a SUCCESS, not an error:
+            # the user's records already contain exactly what they just sent,
+            # and nothing needs to change. Returning 422 here would tell them
+            # their upload failed when it was simply unnecessary.
+            if duplicate_files_skipped and len(duplicate_files_skipped) == len(files):
+                logger.info(
+                    "upload_documents: user=%s all %d file(s) were already on file — "
+                    "nothing to add", user_id, len(files),
+                )
+                snapshot = db.load_patient_snapshot(user_id) or {}
+                return {
+                    "user_id": user_id,
+                    "documents_added": 0,
+                    "documents_total": len(existing_docs),
+                    "timeline": snapshot.get("patient_timeline", {}),
+                    "cross_check_report": snapshot.get("cross_check_report", {}),
+                    "lab_trends": snapshot.get("lab_trends", {}),
+                    "consult_triage": snapshot.get("consult_triage", {}),
+                    "duplicate_files_skipped": duplicate_files_skipped,
+                    "antidote_reference_notes": [],
+                    "indexed": True,
+                }
             raise HTTPException(
                 422,
                 "No medical content found in the uploaded file(s) (all pages were "
                 "demo/placeholder documents).",
             )
-
-        existing_docs = db.load_documents(user_id)
 
         # Check the newly-extracted patient identity (name, fuzzy-matched;
         # age, via inferred birth year so it tolerates the patient aging
@@ -306,8 +411,33 @@ async def upload_documents(
 
     timeline = build_patient_timeline(all_docs)
 
+    # Look the medication list up in the reference graph BEFORE cross-checking,
+    # so any finding about a drug the graph actually documents can be graded as
+    # evidence-backed and cite its source, instead of being capped as
+    # unverifiable model recall. Fail-open as always: no graph just means every
+    # finding grades as model_knowledge, which is the honest default.
+    med_names = sorted({
+        m.get("name") for m in timeline.get("medications_timeline", []) if m.get("name")
+    })
+    antidote_references: Dict[str, Dict[str, Any]] = {}
+    try:
+        logger.info(
+            "upload_documents: user=%s querying antidote graph for %d medication name(s)",
+            user_id, len(med_names),
+        )
+        antidote_references = lookup_antidote_references(med_names)
+    except Exception as e:
+        logger.warning(
+            "upload_documents: user=%s antidote reference lookup skipped, continuing "
+            "without it (findings will grade as unverified model knowledge): %s",
+            user_id, e,
+        )
+    graph_backed_findings = graph_backed_findings_from_antidotes(antidote_references)
+
     if new_docs:
-        cross_check = cross_check_prescriptions(timeline)
+        cross_check = cross_check_prescriptions(
+            timeline, graph_backed_findings=graph_backed_findings
+        )
     else:
         # Nothing proceeded this request (every extracted document was held
         # back pending identity confirmation) -- all_docs is identical to
@@ -315,12 +445,17 @@ async def upload_documents(
         # would only re-derive the same answer already saved. Reuse it
         # instead of spending another OpenAI request on a no-op.
         snapshot = db.load_patient_snapshot(user_id)
-        cross_check = snapshot["cross_check_report"] if snapshot else cross_check_prescriptions(timeline)
+        cross_check = snapshot["cross_check_report"] if snapshot else cross_check_prescriptions(
+            timeline, graph_backed_findings=graph_backed_findings
+        )
 
     issue_count = sum(len(v) for v in cross_check.values() if isinstance(v, list))
+    evidence = cross_check.get("evidence_summary") or {}
     logger.info(
-        "upload_documents: user=%s timeline rebuilt, cross-check found %d issue(s)",
-        user_id, issue_count,
+        "upload_documents: user=%s timeline rebuilt, cross-check found %d issue(s) "
+        "(evidence: %d deterministic, %d reference-graph, %d unverified model knowledge)",
+        user_id, issue_count, evidence.get("deterministic", 0),
+        evidence.get("reference_graph", 0), evidence.get("model_knowledge", 0),
     )
 
     lab_trends = track_lab_trends(timeline)
@@ -329,6 +464,27 @@ async def upload_documents(
         user_id, len(lab_trends["trends"]), len(lab_trends["insufficient_data"]),
     )
 
+    # Route whatever the cross-check and trend tracking found to the
+    # professional who can act on it. Reads only the findings computed above,
+    # so it adds no clinical judgment of its own.
+    consult_triage = triage_consultation(cross_check, lab_trends, timeline)
+    logger.info(
+        "upload_documents: user=%s consult triage: needed=%s type=%s urgency=%s confidence=%s",
+        user_id, consult_triage["consult_needed"], consult_triage["consult_type"],
+        consult_triage["urgency"], consult_triage["confidence"],
+    )
+
+    # Red flag for documents whose English fields were converted from another
+    # language, or that were hard to read. Assessed over the WHOLE record, not
+    # just this upload, so the banner reflects everything currently on file.
+    translation_risk = assess_documents_translation_risk(all_docs)
+    if translation_risk["flag"] != "none":
+        logger.warning(
+            "upload_documents: user=%s translation red flag=%s (high=%d review=%d)",
+            user_id, translation_risk["flag"],
+            translation_risk["counts"]["high"], translation_risk["counts"]["review"],
+        )
+
     # Best-effort: note when a medication the patient is already on is
     # itself WHO-EML-listed under "Antidotes and other substances used in
     # poisonings" (e.g. naloxone, activated charcoal). Never fails the
@@ -336,23 +492,43 @@ async def upload_documents(
     # not part of the patient's own record.
     antidote_notes: List[Dict[str, Any]] = []
     try:
-        med_names = sorted({
-            m.get("name") for m in timeline.get("medications_timeline", []) if m.get("name")
-        })
+        # Reuses the lookup already performed above for evidence grading —
+        # one round trip to the graph per upload, not two.
         antidote_notes = [
             {"medication": name, **ref}
-            for name, ref in sorted(lookup_antidote_references(med_names).items())
+            for name, ref in sorted(antidote_references.items())
         ]
+        if antidote_notes:
+            logger.info(
+                "upload_documents: user=%s antidote graph matched %d of %d medication(s): %s",
+                user_id, len(antidote_notes), len(med_names),
+                ", ".join(n["medication"] for n in antidote_notes),
+            )
+        else:
+            logger.info(
+                "upload_documents: user=%s antidote graph checked %d medication(s), "
+                "none are WHO-listed antidotes",
+                user_id, len(med_names),
+            )
     except Exception as e:
+        # poisoning_kg/graph_db have already logged which step failed. This
+        # records that the upload CONTINUED without the enrichment, which is
+        # the part that matters when reading the request end to end — an
+        # empty antidote_reference_notes below means "not checked", not
+        # "checked and found nothing".
         logger.warning(
-            "upload_documents: user=%s antidote reference lookup skipped: %s", user_id, e,
+            "upload_documents: user=%s antidote reference lookup skipped, continuing "
+            "without it (antidote_reference_notes will be empty): %s", user_id, e,
         )
 
     # Saving the snapshot is what makes this user's records answerable —
     # retrieval.py reads the snapshot directly, so there is no separate
     # index to build, fall out of sync, or fail independently of the write.
     db.insert_documents(user_id, new_docs)
-    db.save_patient_snapshot(user_id, timeline, cross_check, lab_trends=lab_trends)
+    db.save_patient_snapshot(
+        user_id, timeline, cross_check,
+        lab_trends=lab_trends, consult_triage=consult_triage,
+    )
     logger.info(
         "upload_documents: user=%s request complete: documents_added=%d documents_total=%d",
         user_id, len(new_docs), len(all_docs),
@@ -365,7 +541,12 @@ async def upload_documents(
         "timeline": timeline,
         "cross_check_report": cross_check,
         "lab_trends": lab_trends,
+        "consult_triage": consult_triage,
+        "translation_risk": translation_risk,
         "antidote_reference_notes": antidote_notes,
+        # Present (and non-empty) when a re-uploaded file was recognised and
+        # not added a second time.
+        "duplicate_files_skipped": duplicate_files_skipped,
         # Retained for existing clients that branch on it. Always true now:
         # a successful upload is queryable by definition, since Q&A reads the
         # same snapshot this request just wrote.
@@ -484,6 +665,30 @@ async def get_lab_trends(user_id: str = Depends(get_current_user)) -> Dict[str, 
     if "lab_trends" in snapshot:
         return snapshot["lab_trends"]
     return track_lab_trends(snapshot["patient_timeline"])
+
+
+@app.get("/api/v1/consult-triage")
+async def get_consult_triage(user_id: str = Depends(get_current_user)) -> Dict[str, Any]:
+    """Returns who the authenticated user should consult about what was found
+    in their records — a pharmacist or a doctor, how soon, and for a doctor,
+    which specialty — with a confidence score inherited from the finding that
+    triggered each referral.
+
+    `consult_needed: false` means these automated checks found no trigger; it
+    is not a clean bill of health (see the `summary` and `note` fields).
+
+    Recomputed on the fly from the saved cross-check and lab trends for
+    snapshots saved before this field existed."""
+    snapshot = db.load_patient_snapshot(user_id)
+    if snapshot is None:
+        raise HTTPException(404, "No records found for this user.")
+    if "consult_triage" in snapshot:
+        return snapshot["consult_triage"]
+    return triage_consultation(
+        snapshot.get("cross_check_report") or {},
+        snapshot.get("lab_trends") or {},
+        snapshot.get("patient_timeline") or {},
+    )
 
 
 # ---------------------------------------------------------------------------

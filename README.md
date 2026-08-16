@@ -34,7 +34,9 @@ budget-constrained fallback.
 |---|---|
 | [`medical_extractor.py`](medical_extractor.py) | Extraction, timeline building, cross-checking, on-disk persistence (CLI) |
 | [`document_filter.py`](document_filter.py) | Rejects non-medical uploads (post-extraction, no extra API call) |
+| [`language_guard.py`](language_guard.py) | Rejects a document whose language couldn't be normalized into the English fields cross-document matching depends on, with an actionable error (no extra API call) |
 | [`lab_trends.py`](lab_trends.py) | Tracks each lab test across visits — direction of drift, reference-range crossings, plain-language explanation (deterministic, no LLM call) |
+| [`consult_triage.py`](consult_triage.py) | Routes the cross-check and trend findings to a pharmacist or a doctor — how urgently, with what confidence, and for a doctor, which specialty (deterministic routing; one LLM call only to name a specialty) |
 | [`retrieval.py`](retrieval.py) | Cross-document context assembly + single-shot Q&A, with the deterministic consult/confidence guard (Phase 1) |
 | [`conversation.py`](conversation.py) | Multi-turn sessions, query rewriting, entity focus carry-over, safety-aware summarization (Phase 2) |
 | [`api.py`](api.py) | HTTP API over all of the above (Phase 3) |
@@ -229,11 +231,51 @@ Response `201`:
   "lab_trends": {
     "trends": [],
     "insufficient_data": [],
-    "note": "This trend analysis is computed directly from the extracted lab values and reference ranges — it is not a diagnosis and does not account for clinical context beyond the numbers shown. Consult the patient's doctor or a pharmacist to interpret what any trend means for their care."
+    "note": "This is worked out directly from the numbers printed on the uploaded lab reports and the normal ranges printed alongside them. It shows how results have changed over time — it does not say what caused a change, and it is not a diagnosis. It also cannot see anything your reports don't show, such as how you are feeling or any other health condition. A doctor or pharmacist can explain what these results mean for you."
+  },
+  "consult_triage": {
+    "consult_needed": true,
+    "consult_type": "doctor",
+    "urgency": "urgent",
+    "urgency_meaning": "make contact today or tomorrow, and do not wait for a scheduled appointment",
+    "confidence": 0.9,
+    "recommended_specialties": [
+      {
+        "specialty": "General practitioner (family doctor)",
+        "reason": "A general practitioner is the right first contact — they hold the whole record, can treat this directly if it is straightforward, and can refer on to a specialist if it is not.",
+        "confidence": 0.7,
+        "basis": "default",
+        "urgency": "urgent",
+        "triggered_by": ["Amoxicillin vs allergy 'Penicillin'"]
+      }
+    ],
+    "pharmacist_actions": [],
+    "doctor_actions": [
+      {
+        "trigger": "allergy_conflict",
+        "subject": "Amoxicillin vs allergy 'Penicillin'",
+        "detail": "Amoxicillin is a penicillin-class antibiotic and may trigger a reaction in patients with a penicillin allergy.",
+        "route": "doctor",
+        "urgency": "urgent",
+        "why_this_route": "A medication on file conflicts with an allergy recorded in these same documents. Resolving it means changing or substituting the prescription, which is a prescribing decision.",
+        "confidence": 0.9,
+        "specialty": { "...": "..." }
+      }
+    ],
+    "referral_items": [ { "...": "every item above, most urgent first" } ],
+    "summary": "A doctor should be consulted — make contact today or tomorrow…",
+    "emergency_advice": "…anyone with severe or sudden symptoms should seek emergency care immediately…",
+    "note": "…routing suggestion, not a diagnosis…"
   },
   "indexed": true
 }
 ```
+
+`consult_needed: false` means these automated checks found no trigger — it
+is **not** a clean bill of health, and both the `summary` and `note` fields
+say so explicitly. The module never de-escalates: a low `confidence` lowers
+the score but never the `urgency`, because an uncertain allergy conflict is
+a reason to confirm it, not to ignore it.
 
 If indexing fails (e.g. embeddings API error), `indexed: false` and an
 `index_error` field are included instead — the timeline/cross-check are
@@ -241,7 +283,8 @@ still returned and saved.
 
 Errors: `400` no files / unsupported extension, `422` extraction failed for
 a given file, `422` a file extracted successfully but doesn't look like a
-medical document (see below). A document whose extracted identity doesn't
+medical document (see below), `422` a file whose language could not be
+normalized for cross-document matching (see below). A document whose extracted identity doesn't
 match this account's other documents is not an error — see "Different-patient
 / identity mismatch detection" below; the request still returns `201`.
 
@@ -260,6 +303,76 @@ extraction that already ran:
 
 For multi-page PDFs, each page is checked individually and the page number
 is included in the error (`'file.pdf (page 2)'`).
+
+**Unresolved-language rejection** — documents in any language are supported,
+but only because extraction **normalizes** them: `ingredients` always comes
+back as the English generic (INN) name, whatever the document was printed in.
+Everything downstream is built on that — `retrieval._med_group_key()` groups a
+drug across documents by its normalized ingredients, and
+`detect_exact_duplicate_medications()` keys on the ingredient set.
+
+When that normalization silently fails on one document, the damage is
+invisible and lands exactly where it matters: the same drug under two
+languages produces two different group keys, so the duplicate is never
+spotted and the interaction check never sees both halves. Nothing errors, and
+the record *looks* complete. [`language_guard.py`](language_guard.py) turns
+that into a `422` instead:
+
+```json
+{"detail": "'japanese_rx.pdf' could not be processed reliably: This document is in Japanese, and some details could not be converted into the standard English form your records are matched on (1 field(s) affected). Uploading a clearer scan or photo usually fixes this. If the document is correct as-is, ask your pharmacist or doctor for a copy that also lists the generic (non-brand) drug names."}
+```
+
+Extraction now also reports `document_language` and `additional_languages`
+(mixed-language documents — English drug names with Sinhala instructions, say
+— are common and fully supported; the guard names every language it saw in
+the error).
+
+**Red flag: two separate confidence scores.** Extraction reports
+`ocr_confidence` and `translation_confidence` as independent numbers, because
+they are independent risks with different fixes:
+
+| | What it measures | When it's low | The fix |
+|---|---|---|---|
+| `ocr_confidence` | Could we read the characters off the page? | Handwriting, blur, glare, cut-off edges | Upload a clearer scan |
+| `translation_confidence` | Did we convert it into English faithfully? | Transliterated drug name, unfamiliar regional brand, ambiguous dosing phrase | Have a pharmacist confirm the generic names |
+
+A crisply printed Japanese prescription scores *high* on reading and lower on
+conversion; a blurry English note is the exact opposite. One blended number
+hides which one went wrong — and tells the user to do the wrong thing half
+the time. Verified against the live model: a clean English document came back
+0.98 / 0.95, a crisp Japanese one 0.98 / 0.95 with `ロキソニン` correctly
+resolved to Loxoprofen, and a deliberately degraded English scan 0.55 / 0.82.
+
+`language_guard.assess_translation_risk(doc)` grades those into a
+`flag` of `"none"` / `"review"` / `"high"`, and
+`assess_documents_translation_risk(docs)` rolls the whole record into one
+banner — returned as `translation_risk` on the upload response. The two axes
+are combined by **multiplying** them (`effective_confidence`), since a perfect
+conversion of a misread word is still wrong; that catches documents where each
+axis clears its own threshold but the pair doesn't (0.65 × 0.75 = 0.49).
+
+The flag never blocks an upload — the binary `422` above is for proof of
+failure, this is the graduated half. It also stays silent on documents that
+report no language at all (anything extracted before these fields existed):
+"we don't know" isn't evidence a document was translated, and firing on the
+whole back catalogue would just train people to dismiss the flag. A flagged
+non-English document also surfaces in
+[`consult_triage.py`](consult_triage.py) as a `translation_uncertain` item
+routed to a pharmacist, who holds both the original document and the
+dispensing record.
+
+**It rejects failed normalization, never an unfamiliar language.** Every check
+fires only on positive evidence that something went wrong — an `ingredients`
+entry still in the document's own script (an INN is always Latin), or a
+non-Latin drug name with no ingredient resolved at all. A Tamil prescription
+whose ingredients came back as `["Metformin"]` passes, and so does a document
+whose `document_language` is `null` if its fields normalized correctly: the
+normalization is what matters, and it demonstrably worked. Like the
+non-medical filter, this costs no extra model call and runs before any
+Cloudinary upload or cross-check.
+
+The CLI reports the same problem per file and skips it, rather than aborting
+the whole folder run.
 
 **Different-patient / identity mismatch detection** — this app is one
 patient per account, so [`identity_guard.py`](identity_guard.py) checks
@@ -311,6 +424,7 @@ entirely. The response is still `201`, with an added
   "timeline": { "...": "reflects only the documents that were added" },
   "cross_check_report": { "...": "..." },
   "lab_trends": { "...": "..." },
+  "consult_triage": { "...": "..." },
   "identity_review_needed": {
     "error": "patient_name_mismatch",
     "message": "1 of 2 uploaded document group(s) (Suresh Babu) don't match the patient on your other document(s) and were not added. Confirm to add them anyway, or leave them out.",
@@ -396,6 +510,8 @@ curl -H "Authorization: Bearer $TOKEN" -H "X-User-Id: $USER_ID" \
   "trends": [
     {
       "test_name": "Fasting Glucose",
+      "plain_name": "a blood sugar test",
+      "what_it_measures": "a test showing the amount of sugar in the blood",
       "unit": "mg/dL",
       "reference_range": "70-99",
       "data_points": [
@@ -408,13 +524,13 @@ curl -H "Authorization: Bearer $TOKEN" -H "X-User-Id: $USER_ID" \
       "crossed_into_abnormal_at": {"date": "20 Apr 2026", "flag": "high"},
       "approaching_threshold": false,
       "confidence": 0.95,
-      "explanation": "Fasting Glucose has risen across 3 tests (reference range 70-99 mg/dL), from 91 mg/dL to 118 mg/dL ... It moved from within the normal range into the 'high' range starting with the 20 Apr 2026 test, and has stayed there since."
+      "explanation": "Fasting Glucose is a test showing the amount of sugar in the blood. Looking at the 3 times this was tested, the result has been going up: 91 mg/dL on 05 Jan 2026, then 103 mg/dL on 20 Apr 2026, then 118 mg/dL on 30 Aug 2026. The normal range for this test is 70 to 99 mg/dL. The result went from inside the normal range to higher than the normal range at the 20 Apr 2026 test, and has stayed there since. These numbers only show what was measured and when. They do not say what caused the change or what it means — a doctor or pharmacist can explain that."
     }
   ],
   "insufficient_data": [
     {"test_name": "TSH", "reason": "only 1 usable data point(s) with a parseable date and numeric value (need at least 2 to establish a trend); 0 entrie(s) were dropped."}
   ],
-  "note": "This trend analysis is computed directly from the extracted lab values and reference ranges — it is not a diagnosis and does not account for clinical context beyond the numbers shown. Consult the patient's doctor or a pharmacist to interpret what any trend means for their care."
+  "note": "This is worked out directly from the numbers printed on the uploaded lab reports and the normal ranges printed alongside them. It shows how results have changed over time — it does not say what caused a change, and it is not a diagnosis. It also cannot see anything your reports don't show, such as how you are feeling or any other health condition. A doctor or pharmacist can explain what these results mean for you."
 }
 ```
 
@@ -423,6 +539,22 @@ if it's been drifting toward a reference-range boundary across visits (e.g.
 Creatinine rising from 0.92 → 1.08 → 1.32 against a 0.74–1.35 range) — this
 surfaces that drift before it's officially out of range, not just after.
 
+**`explanation` is written for the patient, not the clinician.** Lab reports
+print abbreviations that mean nothing to most people reading their own
+results, so the text spells them out (`plain_name` / `what_it_measures` carry
+the same gloss as separate fields), says "the normal range" rather than
+"reference range", "higher than the normal range" rather than "elevated", and
+lists readings as "91 mg/dL on 05 Jan 2026, then 103 mg/dL on 20 Apr 2026".
+
+The glossary describes only what a test **measures**, never what a result
+means — "ALT is one of the tests used to check how the liver is working" is a
+description; "a high ALT means liver damage" would be a diagnosis this module
+must never make. A test that isn't in the glossary keeps its printed name with
+no gloss (`plain_name: null`), which is honest — a wrong gloss on a guessed
+test would be worse than none. The exact values, units, ranges and flags stay
+in the structured fields alongside the text, so nothing is lost for callers
+that need precision.
+
 Tests with fewer than 2 usable (dated + numeric) readings are listed under
 `insufficient_data` with a reason, rather than a fabricated single-point
 "trend". Reports saved before this feature existed don't have a
@@ -430,6 +562,62 @@ Tests with fewer than 2 usable (dated + numeric) readings are listed under
 the saved timeline in that case.
 
 `404` if this patient has never been processed.
+
+#### `GET /api/v1/consult-triage`
+
+Returns who this user should actually talk to about what the pipeline found
+— a **pharmacist** or a **doctor**, how soon, with what confidence, and if a
+doctor, **which specialty**. Computed by
+[`consult_triage.py`](consult_triage.py) from the cross-check and lab-trend
+findings that already exist; it adds no clinical judgment of its own.
+
+```
+curl -H "Authorization: Bearer $TOKEN" -H "X-User-Id: $USER_ID" \
+  http://127.0.0.1:8000/api/v1/consult-triage
+```
+
+Routing is deterministic (a table, not a model call), because *who resolves
+a finding* is a question about scope of practice rather than medicine:
+
+| Finding | Routed to | Urgency | Why |
+|---|---|---|---|
+| Allergy conflict | doctor | urgent | Needs the prescription changed — a prescribing decision |
+| Drug interaction (high) | doctor | urgent | The combination itself needs reconsidering |
+| Drug interaction (moderate/low) | pharmacist | soon / routine | Managed by timing, spacing, monitoring — no appointment needed |
+| Duplicate prescription | pharmacist | soon | Medication reconciliation is a pharmacist's core competency |
+| Conflicting dosage instructions | pharmacist | soon | They can check the dispensing record for which instruction stands |
+| Lab crossed out of range | doctor | soon | Interpreting a result is a diagnostic act |
+| Lab persistently abnormal | doctor | soon | Only the treating doctor can confirm it's already being managed |
+| Lab approaching a boundary | doctor | routine | Nothing abnormal yet — worth raising at the next appointment |
+| Unreadable document | pharmacist | routine | Data-quality check against the dispensing record, not a clinical finding |
+
+Specialty selection is the one part needing medical knowledge, so it
+resolves in three steps: a rule map covers the common lab tests
+(liver → hepatology, creatinine/eGFR → nephrology, HbA1c → endocrinology,
+…), one LLM call handles what the map can't, and anything still unresolved
+falls back to a general practitioner. **A failed API call costs a specialty
+name, never the referral itself.**
+
+Two safety properties hold regardless of what was found:
+
+- **It never de-escalates.** `consult_needed: false` means these specific
+  checks found no trigger — not "you're fine", and never a reason to skip
+  care. The `summary` text says this outright.
+- **Low confidence never lowers urgency.** `confidence` is inherited from
+  the finding that triggered the referral and describes how sure the
+  pipeline is that it's *real* — not how safely it can be ignored. A
+  barely-legible allergy conflict is reported at full urgency with a low
+  score and a `confidence_caveat` telling the reader to check the original
+  document.
+
+There is deliberately no "emergency" urgency level: every finding here comes
+from uploaded documents, which describe the past. The standing
+`emergency_advice` field covers anything happening right now.
+
+Snapshots saved before this feature existed have no `consult_triage` field —
+this endpoint recomputes it on the fly from the saved cross-check and trends.
+
+`404` if this user has never uploaded a document.
 
 ---
 

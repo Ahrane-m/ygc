@@ -56,6 +56,13 @@ def print_summary(record: dict) -> None:
     print(f"Known allergies:        {len(timeline.get('known_allergies') or [])}")
     print(f"Cross-check computed:   {bool(record.get('cross_check_report'))}")
     print(f"Lab trends computed:    {len((record.get('lab_trends') or {}).get('trends') or [])}")
+    triage = record.get("consult_triage") or {}
+    if triage.get("consult_needed"):
+        print(f"Consult routing:        {triage.get('consult_type')} "
+              f"({triage.get('urgency')}, confidence {triage.get('confidence')})")
+    else:
+        print(f"Consult routing:        "
+              f"{'no trigger found' if triage else 'not computed'}")
     print()
     print(f"Full context size:      {len(context)} chars "
           f"(budget {retrieval.DEFAULT_CONTEXT_BUDGET_CHARS})")

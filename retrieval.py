@@ -541,11 +541,28 @@ def _render_safety_flags(cross_check: Dict[str, Any]) -> str:
     lines = ["SAFETY CROSS-CHECK (already computed over the full record):"]
     empty = True
 
+    def _evidence(item: Dict[str, Any]) -> str:
+        """Marks whether a finding is verified or is unconfirmed model recall,
+        so the answer can carry that distinction instead of presenting both
+        with equal authority."""
+        source = item.get("evidence_source")
+        if source == "deterministic":
+            return " [VERIFIED from the patient's own records]"
+        if source == "reference_graph":
+            return " [BACKED BY a reference document in the knowledge graph]"
+        if source == "model_knowledge":
+            return (
+                " [UNVERIFIED — general medical knowledge, not confirmed by any "
+                "drug-interaction database in this system; say so if you rely on it]"
+            )
+        return ""
+
     for item in cross_check.get("potential_drug_interactions") or []:
         empty = False
         lines.append(
             f"- INTERACTION ({item.get('severity', 'unknown')} severity, confidence "
-            f"{item.get('confidence')}): {', '.join(item.get('medications_involved') or [])} — "
+            f"{item.get('confidence')}){_evidence(item)}: "
+            f"{', '.join(item.get('medications_involved') or [])} — "
             f"{item.get('explanation')}"
         )
     for item in cross_check.get("duplicate_prescriptions") or []:
@@ -572,7 +589,8 @@ def _render_safety_flags(cross_check: Dict[str, Any]) -> str:
     for item in cross_check.get("allergy_conflicts") or []:
         empty = False
         lines.append(
-            f"- ALLERGY CONFLICT (confidence {item.get('confidence')}): {item.get('medication')} vs "
+            f"- ALLERGY CONFLICT (confidence {item.get('confidence')}){_evidence(item)}: "
+            f"{item.get('medication')} vs "
             f"allergy '{item.get('allergy')}' — {item.get('explanation')}"
         )
 
@@ -580,6 +598,49 @@ def _render_safety_flags(cross_check: Dict[str, Any]) -> str:
         lines.append("- No interactions, duplicates, dosage conflicts or allergy conflicts were flagged.")
     if cross_check.get("overall_recommendation"):
         lines.append(f"- Overall: {cross_check['overall_recommendation']}")
+    return "\n".join(lines)
+
+
+def _render_consult_routing(triage: Dict[str, Any]) -> str:
+    """Surfaces the already-computed consultation routing (see
+    consult_triage.py) so an answer about "should I see someone?" reflects
+    the same pharmacist/doctor decision the rest of the pipeline reached,
+    rather than the answering model improvising its own."""
+    if not triage:
+        return "CONSULTATION ROUTING: not yet computed for this patient."
+
+    if not triage.get("consult_needed"):
+        return (
+            "CONSULTATION ROUTING: no automated trigger for a consultation was found. "
+            "State plainly that this is NOT a clean bill of health — it means only that "
+            "these specific checks found nothing in the uploaded documents, and the "
+            "patient should still raise any symptom or concern with their doctor or "
+            "pharmacist."
+        )
+
+    lines = [
+        f"CONSULTATION ROUTING (already computed): consult a "
+        f"{triage.get('consult_type')} — {triage.get('urgency_meaning') or triage.get('urgency')} "
+        f"(confidence {triage.get('confidence')}).",
+    ]
+
+    for specialty in triage.get("recommended_specialties") or []:
+        lines.append(
+            f"- SPECIALTY: {specialty.get('specialty')} (confidence "
+            f"{specialty.get('confidence')}) for {', '.join(specialty.get('triggered_by') or [])}"
+            f" — {specialty.get('reason')}"
+        )
+
+    for item in triage.get("referral_items") or []:
+        caveat = " [LOW CONFIDENCE — verify against the original document]" if item.get(
+            "confidence_caveat"
+        ) else ""
+        lines.append(
+            f"- {item.get('trigger')} -> {item.get('route')} ({item.get('urgency')}, "
+            f"confidence {item.get('confidence')}): {item.get('subject')}{caveat}"
+        )
+
+    lines.append(f"- Why this routing: {triage.get('summary')}")
     return "\n".join(lines)
 
 
@@ -604,10 +665,12 @@ def _fit_to_budget(
     valuable sections first.
 
     Sections marked mandatory are never trimmed: the document manifest, the
-    allergy list, and the safety cross-check. Cutting those is what turns a
-    space problem into a safety problem — a truncated manifest makes "that
-    isn't in your records" a lie, and a truncated allergy list makes the
-    consult recommendation fire on incomplete grounds. Elastic sections are
+    allergy list, the safety cross-check, and the consultation routing.
+    Cutting those is what turns a space problem into a safety problem — a
+    truncated manifest makes "that isn't in your records" a lie, a truncated
+    allergy list makes the consult recommendation fire on incomplete grounds,
+    and a truncated routing block drops who the patient was told to see and
+    how urgently. Elastic sections are
     trimmed from the bottom up (clinical notes, then labs, then medications),
     and anything reduced past usefulness is replaced by an explicit marker so
     the model states what it wasn't shown rather than implying absence.
@@ -658,6 +721,7 @@ def build_full_context(record: Dict[str, Any]) -> str:
         _render_labs(group_lab_results(timeline), record.get("lab_trends") or {}),
         _render_clinical_notes(timeline),
         _render_safety_flags(record.get("cross_check_report") or {}),
+        _render_consult_routing(record.get("consult_triage") or {}),
     ])
 
 
@@ -854,6 +918,8 @@ def build_planned_context(
              "text": _render_clinical_notes(timeline, only_files=only_files)},
             {"label": "SAFETY CROSS-CHECK", "mandatory": True,
              "text": _render_safety_flags(record.get("cross_check_report") or {})},
+            {"label": "CONSULTATION ROUTING", "mandatory": True,
+             "text": _render_consult_routing(record.get("consult_triage") or {})},
         ],
         budget_chars,
     )
@@ -921,12 +987,33 @@ RULES:
   "I don't have enough information" rather than guessing or using outside
   medical knowledge.
 - NEVER provide a diagnosis or interpret what a result "means" clinically.
+- Write for someone with NO medical background. Spell out any abbreviation
+  printed on a document the first time you use it, keeping the printed form
+  in brackets so they can find it on their report (e.g. "a kidney test
+  (Creatinine)"). Say "the normal range" rather than "reference range", and
+  "higher than the normal range" rather than "elevated" or "abnormal". The
+  "PLAIN LANGUAGE" line under each lab result is already written this way —
+  match its register, and prefer it over the raw numbers when explaining a
+  trend. Naming what a test looks at is allowed; saying what a result implies
+  about someone's health is the diagnosis rule above and is not.
 - Prefer answers that span documents when the question calls for it: compare
   dates, name which document each fact came from, and state the direction of
   any change over time.
 - Whenever the question touches risk, drug interactions, allergy conflicts,
   or changing/adjusting a dosage, explicitly recommend consulting a doctor or
   pharmacist and set recommend_professional_consult to true.
+- Safety findings are marked VERIFIED, BACKED BY a reference document, or
+  UNVERIFIED. Never present an UNVERIFIED finding as established fact: say
+  plainly that it comes from general medical knowledge and has not been
+  checked against a drug-interaction database, and that a pharmacist can
+  confirm it. Do not "upgrade" it by sounding certain, and do not dismiss it
+  either — unverified means unconfirmed, not wrong.
+- When asked WHO to see, how urgently, or which kind of doctor, answer from
+  the "CONSULTATION ROUTING" section — it was computed over the whole record
+  and is the pipeline's own routing. Do not substitute your own judgment of
+  who to see or invent a specialty it does not name. If that section says no
+  trigger was found, say plainly that this is not a clean bill of health and
+  that any symptom or concern still warrants contacting a professional.
 - Cite the date and source_file of every record you rely on in "sources".
 - Set cross_document to true if your answer combined facts from more than one
   source document.
