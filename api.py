@@ -35,6 +35,7 @@ Env:
     CLOUDINARY_API_SECRET, JWT_SECRET
 """
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -65,6 +66,7 @@ from lab_trends import track_lab_trends
 from medical_extractor import (
     _is_demo_document,
     build_patient_timeline,
+    cross_check_inputs_fingerprint,
     cross_check_prescriptions,
     process_document,
 )
@@ -74,6 +76,7 @@ from poisoning_kg import (
     lookup_antidote_references,
 )
 from retrieval import answer_question
+from risk_timeline import build_treatment_windows, concurrent_exposure, risk_calendar
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("api")
@@ -250,7 +253,12 @@ async def upload_documents(
                 user_id, upload.filename, len(content), content_sha256[:12],
             )
             try:
-                result = process_document(str(tmp_path))
+                # Off the event loop. process_document() blocks for ~44s on a
+                # vision extraction, and running that inline in an async
+                # handler stalls every other request the worker is serving —
+                # including ones doing no model work at all. asyncio.to_thread
+                # also makes the concurrent extraction below possible.
+                result = await asyncio.to_thread(process_document, str(tmp_path))
             except Exception as e:
                 logger.error(
                     "upload_documents: user=%s extraction failed for '%s': %s",
@@ -434,23 +442,52 @@ async def upload_documents(
         )
     graph_backed_findings = graph_backed_findings_from_antidotes(antidote_references)
 
-    if new_docs:
-        cross_check = cross_check_prescriptions(
-            timeline, graph_backed_findings=graph_backed_findings
+    # The cross-check is the single most expensive step in an upload (~44s on
+    # a real record, about half the request). It is a pure function of the
+    # medication timeline plus allergies, so an upload that leaves both
+    # untouched — a lab report, a re-upload, a prescription for drugs already
+    # on file — cannot get a different answer. Comparing a hash of those exact
+    # inputs against the saved one turns those uploads into a snapshot read.
+    cross_check_fingerprint = cross_check_inputs_fingerprint(timeline)
+    previous = db.load_patient_snapshot(user_id)
+    reusable = (
+        previous
+        and previous.get("cross_check_report")
+        and previous.get("cross_check_fingerprint") == cross_check_fingerprint
+    )
+
+    if reusable:
+        cross_check = previous["cross_check_report"]
+        logger.info(
+            "upload_documents: user=%s reusing saved cross-check — medication and "
+            "allergy inputs are byte-identical (skipped one OpenAI call)", user_id,
+        )
+    elif not new_docs and previous and previous.get("cross_check_report"):
+        # Nothing proceeded this request (every extracted document was held
+        # back pending identity confirmation), so all_docs matches what is
+        # already on file.
+        cross_check = previous["cross_check_report"]
+        logger.info(
+            "upload_documents: user=%s no documents proceeded — reusing saved "
+            "cross-check", user_id,
         )
     else:
-        # Nothing proceeded this request (every extracted document was held
-        # back pending identity confirmation) -- all_docs is identical to
-        # what's already on file, so re-running the cross-check LLM call
-        # would only re-derive the same answer already saved. Reuse it
-        # instead of spending another OpenAI request on a no-op.
-        snapshot = db.load_patient_snapshot(user_id)
-        cross_check = snapshot["cross_check_report"] if snapshot else cross_check_prescriptions(
-            timeline, graph_backed_findings=graph_backed_findings
+        cross_check = await asyncio.to_thread(
+            cross_check_prescriptions, timeline,
+            graph_backed_findings=graph_backed_findings,
         )
 
     issue_count = sum(len(v) for v in cross_check.values() if isinstance(v, list))
     evidence = cross_check.get("evidence_summary") or {}
+    timing = cross_check.get("timing_summary") or {}
+    if timing:
+        logger.info(
+            "upload_documents: user=%s findings in time: %d concurrent, %d possible, "
+            "%d never overlapped (historical), %d undatable; %d double-dose period(s)",
+            user_id, timing.get("concurrent", 0), timing.get("possible", 0),
+            timing.get("not_concurrent", 0), timing.get("unknown", 0),
+            len(cross_check.get("concurrent_exposure") or []),
+        )
     logger.info(
         "upload_documents: user=%s timeline rebuilt, cross-check found %d issue(s) "
         "(evidence: %d deterministic, %d reference-graph, %d unverified model knowledge)",
@@ -528,6 +565,7 @@ async def upload_documents(
     db.save_patient_snapshot(
         user_id, timeline, cross_check,
         lab_trends=lab_trends, consult_triage=consult_triage,
+        cross_check_fingerprint=cross_check_fingerprint,
     )
     logger.info(
         "upload_documents: user=%s request complete: documents_added=%d documents_total=%d",
@@ -665,6 +703,34 @@ async def get_lab_trends(user_id: str = Depends(get_current_user)) -> Dict[str, 
     if "lab_trends" in snapshot:
         return snapshot["lab_trends"]
     return track_lab_trends(snapshot["patient_timeline"])
+
+
+@app.get("/api/v1/risk-timeline")
+async def get_risk_timeline(user_id: str = Depends(get_current_user)) -> Dict[str, Any]:
+    """Returns this user's safety findings placed in time — which risks were
+    live during which dates, most recent period first, plus any period where
+    two prescriptions supplied the same ingredient at once.
+
+    Two drugs only interact if they were taken together, so findings whose
+    courses never overlapped are grouped separately as history rather than
+    presented as current risks. Computed from the printed prescription dates
+    and durations — no model call."""
+    snapshot = db.load_patient_snapshot(user_id)
+    if snapshot is None:
+        raise HTTPException(404, "No records found for this user.")
+
+    timeline = snapshot.get("patient_timeline") or {}
+    cross_check = snapshot.get("cross_check_report") or {}
+    return {
+        "calendar": risk_calendar(cross_check, timeline),
+        "concurrent_exposure": concurrent_exposure(timeline),
+        "treatment_windows": [
+            {**w, "start": w["start"].isoformat() if w["start"] else None,
+             "end": w["end"].isoformat() if w["end"] else None}
+            for w in build_treatment_windows(timeline)
+        ],
+        "timing_summary": cross_check.get("timing_summary") or {},
+    }
 
 
 @app.get("/api/v1/consult-triage")

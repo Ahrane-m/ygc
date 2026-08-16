@@ -18,6 +18,7 @@ import io
 import re
 import json
 import base64
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -961,6 +962,30 @@ def detect_exact_duplicate_medications(timeline: Dict[str, Any]) -> List[Dict[st
     return duplicates
 
 
+def cross_check_inputs_fingerprint(timeline: Dict[str, Any]) -> str:
+    """
+    Hash of exactly what cross_check_prescriptions() sends to the model.
+
+    The cross-check is the most expensive step in an upload — around 44 seconds
+    on a real record, roughly half the whole request. But it is a pure function
+    of the medication timeline plus the allergy list, and many uploads don't
+    touch either: adding a lab report, re-uploading a document, or adding a
+    prescription for drugs already on file all leave these inputs identical.
+    Comparing this fingerprint against the saved one lets those uploads reuse
+    the stored report instead of paying for an answer that cannot differ.
+
+    Deliberately hashes the payload itself rather than a document count or a
+    timestamp, so it is impossible for the inputs to change without the
+    fingerprint changing with them.
+    """
+    payload = {
+        "medications_timeline": timeline.get("medications_timeline") or [],
+        "known_allergies": timeline.get("known_allergies") or [],
+    }
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def cross_check_prescriptions(
     timeline: Dict[str, Any],
     model: str = MODEL,
@@ -1012,6 +1037,16 @@ def cross_check_prescriptions(
     # drug-interaction database).
     from evidence_grading import grade_cross_check
     grade_cross_check(result, graph_backed_findings)
+
+    # Place every finding in time. Two drugs only interact if the patient was
+    # taking them at the same time, and the model compares a flat list with no
+    # notion of when each course started or ended — on a real record, three of
+    # four flagged interactions were between courses that finished months or
+    # years apart. Nothing is removed; findings that were never concurrent are
+    # marked so they can be shown as history rather than as a live risk.
+    from risk_timeline import annotate_findings_with_timing, concurrent_exposure
+    annotate_findings_with_timing(result, timeline)
+    result["concurrent_exposure"] = concurrent_exposure(timeline)
 
     return result
 

@@ -557,13 +557,41 @@ def _render_safety_flags(cross_check: Dict[str, Any]) -> str:
             )
         return ""
 
+    def _when(item: Dict[str, Any]) -> str:
+        """States whether the drugs were actually taken together, and when. A
+        pair whose courses finished years apart is history, not a live risk,
+        and an answer that omits that reads as a current warning."""
+        timing = item.get("timing") or {}
+        status = timing.get("status")
+        if status == "concurrent":
+            return (f" [TAKEN TOGETHER {timing.get('window_start')} to "
+                    f"{timing.get('window_end')}, {timing.get('overlap_days')} days]")
+        if status == "possible":
+            return (f" [MAY have overlapped around {timing.get('window_start')} to "
+                    f"{timing.get('window_end')} — a course has no stated duration]")
+        if status == "not_concurrent":
+            return (f" [NEVER TAKEN TOGETHER — courses ended about "
+                    f"{timing.get('gap_days')} days apart; historical, not a current risk]")
+        return ""
+
     for item in cross_check.get("potential_drug_interactions") or []:
         empty = False
         lines.append(
             f"- INTERACTION ({item.get('severity', 'unknown')} severity, confidence "
-            f"{item.get('confidence')}){_evidence(item)}: "
+            f"{item.get('confidence')}){_evidence(item)}{_when(item)}: "
             f"{', '.join(item.get('medications_involved') or [])} — "
             f"{item.get('explanation')}"
+        )
+
+    for item in cross_check.get("concurrent_exposure") or []:
+        empty = False
+        lines.append(
+            f"- DOUBLE DOSE (confidence 0.9) [VERIFIED from the patient's own records]: "
+            f"{item.get('ingredient')} supplied by two prescriptions at once, "
+            f"{item.get('window_start')} to {item.get('window_end')}"
+            + (f", totalling {item['cumulative_daily_dose']} {item['dosage_unit']}/day"
+               if item.get("cumulative_daily_dose") and item.get("dosage_unit") else "")
+            + f" — {item.get('note')}"
         )
     for item in cross_check.get("duplicate_prescriptions") or []:
         empty = False
@@ -1002,6 +1030,11 @@ RULES:
 - Whenever the question touches risk, drug interactions, allergy conflicts,
   or changing/adjusting a dosage, explicitly recommend consulting a doctor or
   pharmacist and set recommend_professional_consult to true.
+- Safety findings carry TIMING. A finding marked NEVER TAKEN TOGETHER must be
+  described as history, not as a current risk — say the two courses did not
+  overlap and give the dates. For one marked TAKEN TOGETHER, state the period
+  it was live ("between 9 and 23 November 2025"). Never warn about a drug pair
+  as if it were current when the record shows the courses were years apart.
 - Safety findings are marked VERIFIED, BACKED BY a reference document, or
   UNVERIFIED. Never present an UNVERIFIED finding as established fact: say
   plainly that it comes from general medical knowledge and has not been

@@ -114,9 +114,14 @@ def save_patient_snapshot(
     cross_check: Dict[str, Any],
     lab_trends: Optional[Dict[str, Any]] = None,
     consult_triage: Optional[Dict[str, Any]] = None,
+    cross_check_fingerprint: Optional[str] = None,
 ) -> None:
     """Upserts the merged timeline + cross-check report (+ lab trends and
-    consultation triage, if computed) for this user."""
+    consultation triage, if computed) for this user.
+
+    `cross_check_fingerprint` hashes the inputs the cross-check was computed
+    from, so the next upload can tell whether re-running that (expensive)
+    model call could possibly produce a different answer."""
     fields: Dict[str, Any] = {
         "user_id": user_id,
         "patient_timeline": timeline,
@@ -127,6 +132,8 @@ def save_patient_snapshot(
         fields["lab_trends"] = lab_trends
     if consult_triage is not None:
         fields["consult_triage"] = consult_triage
+    if cross_check_fingerprint is not None:
+        fields["cross_check_fingerprint"] = cross_check_fingerprint
     _snapshots().update_one({"user_id": user_id}, {"$set": fields}, upsert=True)
 
 

@@ -161,6 +161,21 @@ ROUTING_RULES: Dict[Tuple[str, Optional[str]], Dict[str, str]] = {
             "the prescription is collected; it rarely requires a change on its own."
         ),
     },
+    ("concurrent_double_dose", None): {
+        "route": "pharmacist",
+        "urgency": "urgent",
+        # Ranked above a plain duplicate: this is not "the same drug appears
+        # twice in your records", it is "two live prescriptions were supplying
+        # it over the same dates". The dose the patient actually took is the
+        # sum, and each prescription looks reasonable alone — which is exactly
+        # why nobody notices.
+        "why_this_route": (
+            "Two prescriptions that were active at the same time both supplied the same "
+            "medicine, so the amount actually taken was the two added together. A "
+            "pharmacist can check the dispensing record and say whether that total was "
+            "safe — they can do this today, without an appointment."
+        ),
+    },
     ("duplicate_prescription", None): {
         "route": "pharmacist",
         "urgency": "soon",
@@ -354,6 +369,44 @@ def _make_item(
     return item
 
 
+def _apply_timing(item: Dict[str, Any], finding: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Folds a finding's treatment-window timing into the routed item.
+
+    A pair of drugs whose courses finished years apart is not a live risk, and
+    routing it at the same urgency as a current one is how a referral list
+    fills with noise. Such findings are NOT dropped — they stay, de-escalated
+    to `routine` and labelled as history, because "you were once on these
+    together" is still worth a mention, just not worth a same-week phone call.
+
+    Note this is the one thing allowed to lower urgency, and it is not a
+    confidence judgment: it is an arithmetic fact about dates, which is exactly
+    the kind of evidence the low-confidence rule was protecting against being
+    overridden by.
+    """
+    timing = finding.get("timing")
+    if not timing:
+        return item
+
+    item["timing"] = timing
+    status = timing.get("status")
+
+    if status == "not_concurrent":
+        item["urgency"] = "routine"
+        item["is_historical"] = True
+        item["why_this_route"] = (
+            "These medicines were never taken at the same time — the courses finished "
+            f"about {timing.get('gap_days')} day(s) apart, so this was not a live risk. "
+            "It is kept on the record because it is worth mentioning at a routine "
+            "appointment, not because anything needs doing now."
+        )
+    elif status in ("concurrent", "possible"):
+        item["is_historical"] = False
+        window = f"{timing.get('window_start')} to {timing.get('window_end')}"
+        item["detail"] = f"{item['detail']} Active {window}.".strip()
+    return item
+
+
 def _items_from_cross_check(cross_check: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Maps each cross_check_prescriptions() finding onto a routed item."""
     items: List[Dict[str, Any]] = []
@@ -375,28 +428,43 @@ def _items_from_cross_check(cross_check: Dict[str, Any]) -> List[Dict[str, Any]]
             # one.
             severity = "moderate"
         involved = finding.get("medications_involved") or []
-        items.append(_make_item(
+        items.append(_apply_timing(_make_item(
             "drug_interaction",
             subject=" + ".join(involved) if involved else "unnamed medications",
             detail=finding.get("explanation") or "",
             confidence=_clamp_confidence(finding.get("confidence")),
             severity=severity,
-        ))
+        ), finding))
 
     for finding in cross_check.get("duplicate_prescriptions") or []:
-        items.append(_make_item(
+        items.append(_apply_timing(_make_item(
             "duplicate_prescription",
             subject=finding.get("medication") or "unnamed medication",
             detail=finding.get("explanation") or "",
             confidence=_clamp_confidence(finding.get("confidence")),
-        ))
+        ), finding))
 
     for finding in cross_check.get("conflicting_dosage_instructions") or []:
-        items.append(_make_item(
+        items.append(_apply_timing(_make_item(
             "dosage_conflict",
             subject=finding.get("medication") or "unnamed medication",
             detail=finding.get("explanation") or "",
             confidence=_clamp_confidence(finding.get("confidence")),
+        ), finding))
+
+    # Periods where two live prescriptions supplied the same ingredient — the
+    # double-dosing exposure the patient can hit without realising, since each
+    # prescription looks reasonable on its own. Dated, so it says WHEN.
+    for exposure in cross_check.get("concurrent_exposure") or []:
+        dose = ""
+        if exposure.get("cumulative_daily_dose") is not None and exposure.get("dosage_unit"):
+            dose = (f" Combined that is {exposure['cumulative_daily_dose']} "
+                    f"{exposure['dosage_unit']} per day.")
+        items.append(_make_item(
+            "concurrent_double_dose",
+            subject=exposure.get("ingredient") or "unnamed ingredient",
+            detail=(exposure.get("note") or "") + dose,
+            confidence=0.9,  # arithmetic over dated records, not model inference
         ))
 
     return items
@@ -1045,6 +1113,56 @@ if __name__ == "__main__":
     )
     triggers = {i["trigger"] for i in blurry_english["referral_items"]}
     assert triggers == {"low_extraction_confidence"}, triggers
+
+    # --- Case 7c: timing separates live risks from historical pairings -----
+    timed = triage_consultation(
+        cross_check={
+            "potential_drug_interactions": [
+                {"medications_involved": ["Paracetamol", "Diclofenac"],
+                 "explanation": "Additive GI risk.", "severity": "moderate",
+                 "confidence": 0.6,
+                 "timing": {"status": "concurrent", "window_start": "2025-11-09",
+                            "window_end": "2025-11-23", "overlap_days": 15,
+                            "gap_days": 0, "note": "…"}},
+                {"medications_involved": ["Cetirizine", "Chlorpheniramine"],
+                 "explanation": "Additive sedation.", "severity": "moderate",
+                 "confidence": 0.6,
+                 "timing": {"status": "not_concurrent", "window_start": None,
+                            "window_end": None, "overlap_days": 0,
+                            "gap_days": 861, "note": "…"}},
+            ],
+        },
+        use_llm=False,
+    )
+    live = [i for i in timed["referral_items"] if not i.get("is_historical")]
+    past = [i for i in timed["referral_items"] if i.get("is_historical")]
+    assert len(live) == 1 and len(past) == 1, timed["referral_items"]
+    # The concurrent one keeps its urgency and gains its dates.
+    assert live[0]["urgency"] == "soon"
+    assert "2025-11-09 to 2025-11-23" in live[0]["detail"], live[0]["detail"]
+    # The 861-days-apart one is kept, but de-escalated rather than dropped.
+    assert past[0]["urgency"] == "routine", past[0]
+    assert "861" in past[0]["why_this_route"]
+    assert timed["urgency"] == "soon", "a stale pairing must not set overall urgency"
+
+    # --- Case 7d: concurrent double-dosing is its own, higher trigger ------
+    double = triage_consultation(
+        cross_check={"concurrent_exposure": [
+            {"ingredient": "paracetamol", "status": "concurrent",
+             "window_start": "2025-11-12", "window_end": "2025-11-22",
+             "overlap_days": 11, "cumulative_daily_dose": 5000.0,
+             "dosage_unit": "mg", "sources": [],
+             "note": "Between 2025-11-12 and 2025-11-22, two separate prescriptions "
+                     "supplied paracetamol."},
+        ]},
+        use_llm=False,
+    )
+    assert len(double["referral_items"]) == 1
+    exposure_item = double["referral_items"][0]
+    assert exposure_item["trigger"] == "concurrent_double_dose"
+    assert exposure_item["urgency"] == "urgent", exposure_item
+    assert exposure_item["route"] == "pharmacist"
+    assert "5000.0 mg per day" in exposure_item["detail"], exposure_item["detail"]
 
     # --- Case 8: an unrecognised severity must not silently vanish ---------
     odd_severity = triage_consultation(
