@@ -52,12 +52,12 @@ import graph_db
 import storage
 from auth import get_current_user
 from document_filter import NonMedicalDocumentError, assert_medical_document
+from identity_guard import partition_identity_mismatch
 from lab_trends import track_lab_trends
 from medical_extractor import (
     _is_demo_document,
     build_patient_timeline,
     cross_check_prescriptions,
-    find_patient_name_mismatch,
     process_document,
 )
 from poisoning_kg import (
@@ -148,11 +148,17 @@ async def upload_documents(
     and lab trend tracking. The saved snapshot is what Q&A answers from, so
     the new documents are queryable as soon as this call returns.
 
-    If the extracted patient name doesn't match across the uploaded
-    documents (or against documents already on file for this user), the
-    upload is rejected with 409 instead of silently merging possibly
-    unrelated patients — resubmit with confirm_name_mismatch=true to
-    proceed anyway.
+    If a document's extracted patient identity (name, age, gender) doesn't
+    look consistent with this account's document history — either against
+    documents already on file, or against other documents in the same
+    batch when there's no history yet — it is held back rather than
+    silently merged: everything else in the batch still proceeds normally
+    (still 201), and the response's `identity_review_needed` field
+    describes which document(s) were held and why. See identity_guard.py
+    for the matching/scoring rules (fuzzy name matching, inferred-birth-year
+    age comparison, corroboration across signals) and the no-history/
+    first-upload tie-break behavior. Resubmit just the held file(s) with
+    confirm_name_mismatch=true to add them.
     """
     logger.info("upload_documents: user=%s received %d file(s)", user_id, len(files))
     if not files:
@@ -238,37 +244,54 @@ async def upload_documents(
 
         existing_docs = db.load_documents(user_id)
 
-        # Check the extracted patient name is consistent across this
-        # batch and against whatever's already on file for this user
-        # (api.py assumes one patient per user_id) before doing any
-        # Cloudinary/Mongo work — a caller can override with
-        # confirm_name_mismatch=true if the mismatch is expected.
-        labeled_pages = [
+        # Check the newly-extracted patient identity (name, fuzzy-matched;
+        # age, via inferred birth year so it tolerates the patient aging
+        # between documents; gender) against this account's DOCUMENT
+        # HISTORY (previously-stored documents only — never the account
+        # holder's registered profile name, which is frequently not the
+        # patient's own name). A brand new account has no history to
+        # compare against, so a first-ever upload is only questioned
+        # against itself: if every document in the batch agrees on one
+        # patient, nothing is held back, no matter whose name that is; if
+        # the batch itself disagrees (e.g. one file says "Ramesh", another
+        # says "Suresh"), the larger group is treated as the baseline and
+        # the rest are held. Matching documents proceed immediately —
+        # mismatched ones are held out of THIS request entirely (not
+        # uploaded to Cloudinary, not written to Mongo) rather than
+        # blocking the whole batch. A single noisy signal (e.g. one
+        # OCR-garbled name, a missing gender) never holds a document back
+        # by itself — see identity_guard.py for the corroboration scoring.
+        # Resubmitting just the held file(s) with confirm_name_mismatch=true
+        # adds them without re-litigating whatever already went through.
+        labeled_new_pages = [
             (label, page) for _, _, kept in per_file_pages for label, page in kept
-        ] + [
-            (doc.get("_source", {}).get("file", "a previously uploaded document"), doc)
-            for doc in existing_docs
         ]
-        mismatch = find_patient_name_mismatch(labeled_pages)
-        if mismatch and not confirm_name_mismatch:
-            logger.warning(
-                "upload_documents: user=%s patient name mismatch: %s",
-                user_id, mismatch["distinct_patient_names"],
-            )
-            raise HTTPException(409, {
-                "error": "patient_name_mismatch",
-                "message": (
-                    "These documents don't all show the same patient name "
-                    f"({', '.join(mismatch['distinct_patient_names'])}). If this is "
-                    "expected, resubmit with confirm_name_mismatch=true to proceed anyway."
-                ),
-                "documents": mismatch["documents"],
-            })
+        held_labels = set()
+        mismatch_details: Optional[Dict[str, Any]] = None
+        if not confirm_name_mismatch:
+            partition = partition_identity_mismatch(labeled_new_pages, existing_docs)
+            held_labels = partition["held_labels"]
+            mismatch_details = partition["details"]
+            if mismatch_details is not None:
+                logger.warning(
+                    "upload_documents: user=%s identity mismatch, holding %d page(s): %s",
+                    user_id, len(held_labels), mismatch_details["message"],
+                )
+
+        # A file is held back in its entirety if ANY of its kept pages was
+        # held — avoids uploading a multi-page document to Cloudinary with
+        # only some of its pages merged into the timeline.
+        proceeding_file_pages = [
+            (tmp_path, filename, kept_pages)
+            for tmp_path, filename, kept_pages in per_file_pages
+            if not any(label in held_labels for label, _ in kept_pages)
+        ]
 
         # Pass 2: everything validated — archive each original file to
         # Cloudinary once, and attach the resulting URL to every page that
-        # came from it.
-        for tmp_path, filename, kept_pages in per_file_pages:
+        # came from it. Held-back files are skipped entirely; their temp
+        # files are simply discarded when this `with` block exits.
+        for tmp_path, filename, kept_pages in proceeding_file_pages:
             upload_info = storage.upload_patient_document(user_id, str(tmp_path), filename)
             for label, page in kept_pages:
                 page["document_url"] = upload_info["document_url"]
@@ -282,7 +305,18 @@ async def upload_documents(
     )
 
     timeline = build_patient_timeline(all_docs)
-    cross_check = cross_check_prescriptions(timeline)
+
+    if new_docs:
+        cross_check = cross_check_prescriptions(timeline)
+    else:
+        # Nothing proceeded this request (every extracted document was held
+        # back pending identity confirmation) -- all_docs is identical to
+        # what's already on file, so re-running the cross-check LLM call
+        # would only re-derive the same answer already saved. Reuse it
+        # instead of spending another OpenAI request on a no-op.
+        snapshot = db.load_patient_snapshot(user_id)
+        cross_check = snapshot["cross_check_report"] if snapshot else cross_check_prescriptions(timeline)
+
     issue_count = sum(len(v) for v in cross_check.values() if isinstance(v, list))
     logger.info(
         "upload_documents: user=%s timeline rebuilt, cross-check found %d issue(s)",
@@ -324,7 +358,7 @@ async def upload_documents(
         user_id, len(new_docs), len(all_docs),
     )
 
-    return {
+    response: Dict[str, Any] = {
         "user_id": user_id,
         "documents_added": len(new_docs),
         "documents_total": len(all_docs),
@@ -337,6 +371,14 @@ async def upload_documents(
         # same snapshot this request just wrote.
         "indexed": True,
     }
+    # Present only when one or more uploaded documents were held back
+    # pending identity confirmation (see identity_guard.py) — everything
+    # else in this response still reflects what WAS successfully added.
+    # Resubmit just the held file(s) with confirm_name_mismatch=true to
+    # add them.
+    if mismatch_details is not None:
+        response["identity_review_needed"] = mismatch_details
+    return response
 
 
 @app.get("/api/v1/timeline")

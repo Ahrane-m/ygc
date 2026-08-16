@@ -98,6 +98,30 @@ the same regardless of what language or units each was printed in:
   into the medication's confidence the same way an inferred brand-to-
   generic mapping is.
 
+PATIENT IDENTITY FIELDS — patient_age and patient_gender exist so
+downstream code can detect when a document was filed under the wrong
+person's account (e.g. a family member's prescription mistakenly uploaded
+to a different family member's profile). Populate them conservatively:
+- patient_gender: infer ONLY from an explicit marker on the document
+  itself — a printed "Sex:"/"Gender:" field, or an honorific tightly
+  bound to the named patient field (e.g. "Mr./Mrs./Ms." directly before
+  the patient's name). Use "male", "female", "other" (an explicit
+  non-binary/other marker), or null if it isn't explicitly stated. Never
+  guess from the name alone — a wrong guess here is worse than null.
+- patient_age: the patient's age IN YEARS AS OF THIS DOCUMENT'S DATE (the
+  `date` field above), not as of today.
+  - If an age is printed directly ("Age: 45", "45Y", "45 yrs"), use it.
+  - If a date of birth is printed instead, compute
+    age = (this document's date) - (date of birth), in whole years.
+  - If neither an age nor a DOB is printed, use null. Never estimate age
+    from appearance, tone, or any other non-explicit cue.
+- Computing age from a DOB, or inferring gender from an honorific, is
+  inference rather than transcription — apply the same confidence
+  discipline as the brand-to-generic ingredient rule above: it should
+  keep overall_confidence out of the top band.
+- These fields are for identity-mismatch detection only — never let them
+  influence document_type, medications, or lab_results extraction.
+
 Rules:
 - If handwriting is unclear, make your best guess but LOWER the confidence
   score for that field and add a note to illegible_or_low_confidence_fields.
@@ -117,6 +141,11 @@ EXTRACTION_JSON_SCHEMA = {
         "date": {"type": ["string", "null"]},
         "provider_or_doctor": {"type": ["string", "null"]},
         "patient_name": {"type": ["string", "null"]},
+        "patient_age": {"type": ["integer", "null"]},
+        "patient_gender": {
+            "type": ["string", "null"],
+            "enum": ["male", "female", "other", None],
+        },
         "medications": {
             "type": "array",
             "items": {
@@ -164,6 +193,7 @@ EXTRACTION_JSON_SCHEMA = {
     },
     "required": [
         "document_type", "date", "provider_or_doctor", "patient_name",
+        "patient_age", "patient_gender",
         "medications", "lab_results", "allergies_noted", "clinical_notes",
         "illegible_or_low_confidence_fields", "overall_confidence",
     ],
