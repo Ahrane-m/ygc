@@ -85,6 +85,15 @@ URGENCY_MEANING = {
     "urgent": "make contact today or tomorrow, and do not wait for a scheduled appointment",
 }
 
+# The same three levels as one short phrase, for the headline. `summary` says
+# everything; a person scanning their results reads one line and stops, so
+# there needs to be a line worth stopping at.
+URGENCY_WHEN = {
+    "routine": "at your next appointment",
+    "soon": "in the next few days",
+    "urgent": "today or tomorrow",
+}
+
 # A pharmacist is reachable without an appointment and can resolve
 # medication-supply questions outright, so it is the lower rung — but "lower"
 # means faster and cheaper, never less safe. Findings that need a prescribing
@@ -159,6 +168,21 @@ ROUTING_RULES: Dict[Tuple[str, Optional[str]], Dict[str, str]] = {
         "why_this_route": (
             "A low-severity interaction is worth mentioning to a pharmacist next time "
             "the prescription is collected; it rarely requires a change on its own."
+        ),
+    },
+    ("guideline_flagged_combination", None): {
+        "route": "doctor",
+        "urgency": "urgent",
+        # The one finding type in this table backed by a named, quotable
+        # source rather than model recall — published guidance says this
+        # specific combination "can greatly increase the risk of overdose".
+        # Resolving it means changing a prescription, which is a doctor's call.
+        "why_this_route": (
+            "A strong painkiller and a sedative were prescribed for the same period. "
+            "Published national guidance warns that this combination can seriously "
+            "slow breathing. Changing either prescription is a doctor's decision, and "
+            "this is worth raising quickly — a pharmacist can also advise today while "
+            "you arrange it."
         ),
     },
     ("concurrent_double_dose", None): {
@@ -263,61 +287,94 @@ ROUTING_RULES: Dict[Tuple[str, Optional[str]], Dict[str, str]] = {
 # this table is deliberately short rather than exhaustive.
 # ---------------------------------------------------------------------------
 
-LAB_SPECIALTY_RULES: List[Tuple[Tuple[str, ...], str, str]] = [
+# (keywords, what to call it to a patient, the clinical name, one short line)
+#
+# The patient-facing name comes first because it is the one that gets shown.
+# Someone reading their own results does not know what hepatology is, and a
+# label you have to look up is a label you skip. The clinical name is kept
+# beside it — a receptionist needs it to book, a clinician expects it — but it
+# is never the thing on screen.
+LAB_SPECIALTY_RULES: List[Tuple[Tuple[str, ...], str, str, str]] = [
     (("alt", "ast", "sgpt", "sgot", "bilirubin", "alkaline phosphatase", "ggt",
       "alp"),
-     "Hepatology (or Gastroenterology)",
-     "these are liver-function tests"),
+     "Liver specialist", "Hepatology / Gastroenterology", "checks your liver"),
     (("creatinine", "egfr", "gfr", "urea", "bun"),
-     "Nephrology",
-     "these are kidney-function tests"),
+     "Kidney specialist", "Nephrology", "checks your kidneys"),
     (("glucose", "hba1c", "a1c", "insulin"),
-     "Endocrinology (diabetes care)",
-     "these are blood-sugar tests"),
+     "Diabetes specialist", "Endocrinology", "checks your blood sugar"),
     (("tsh", "t3", "t4", "thyroid"),
-     "Endocrinology",
-     "these are thyroid-function tests"),
+     "Thyroid specialist", "Endocrinology", "checks your thyroid"),
     (("cholesterol", "ldl", "hdl", "triglyceride", "lipid"),
-     "Cardiology (or a lipid clinic)",
-     "these are lipid/cardiovascular-risk tests"),
+     "Heart specialist", "Cardiology / lipid clinic", "checks the fats in your blood"),
     (("hemoglobin", "haemoglobin", "hematocrit", "haematocrit", "platelet",
       "wbc", "rbc", "mcv", "white blood cell", "red blood cell"),
-     "Hematology",
-     "these are blood-count tests"),
+     "Blood specialist", "Haematology", "checks your blood count"),
     (("inr", "prothrombin", "aptt", "ptt"),
-     "Hematology",
-     "these are blood-clotting tests"),
+     "Blood specialist", "Haematology", "checks how your blood clots"),
     (("uric acid", "urate"),
-     "Rheumatology",
-     "raised uric acid is usually managed as a rheumatological problem"),
+     "Joint specialist", "Rheumatology", "is linked to joint problems like gout"),
     (("psa",),
-     "Urology",
-     "PSA is a prostate test"),
+     "Prostate specialist", "Urology", "checks your prostate"),
     (("troponin", "bnp", "nt-probnp"),
-     "Cardiology",
-     "these are cardiac tests"),
+     "Heart specialist", "Cardiology", "checks your heart"),
 ]
 
-GENERAL_PRACTITIONER = "General practitioner (family doctor)"
+# Triggers that represent a genuine safety finding — something is actually
+# wrong with the medications or results on file. Everything outside this set
+# is either a data-quality note (an unreadable scan, an uncertain translation)
+# or a watch-item that is not yet abnormal.
+ALERT_TRIGGERS = frozenset({
+    "guideline_flagged_combination",
+    "drug_interaction",
+    "allergy_conflict",
+    "duplicate_prescription",
+    "concurrent_double_dose",
+    "dosage_conflict",
+    "lab_crossed_abnormal",
+    "lab_persistently_abnormal",
+})
 
-GP_FIRST_REASON = (
-    "A general practitioner is the right first contact — they hold the whole record, "
-    "can treat this directly if it is straightforward, and can refer on to a "
-    "specialist if it is not. Going straight to a specialist is rarely necessary and "
-    "usually slower."
-)
+
+def _warrants_specialty(item: Dict[str, Any]) -> bool:
+    """
+    Whether this finding is worth naming a KIND of doctor for.
+
+    Naming a specialty is a strong signal — it reads as "you need to see a
+    specialist about this". Attaching one to every doctor-routed item spends
+    that signal on things that don't warrant it: a lab value still inside its
+    normal range that has merely drifted a little, or a drug pairing from a
+    course that ended two years ago. Both are worth a mention at a routine
+    appointment; neither is worth telling someone to find a hepatologist.
+
+    So a specialty is named only when there is a real safety finding, or when
+    the finding is uncertain enough that someone needs to confirm it. A
+    historical pairing is neither, whatever its confidence — courses that
+    never overlapped were not a risk, so there is nothing for a specialist to
+    act on.
+    """
+    if item.get("is_historical"):
+        return False
+    if item["trigger"] in ALERT_TRIGGERS:
+        return True
+    return item["confidence"] <= LOW_CONFIDENCE_THRESHOLD
 
 
-def _match_lab_specialty(test_name: str) -> Optional[Tuple[str, str]]:
-    """Returns (specialty, reason_fragment) for a test name the rule table
-    covers, else None — in which case the LLM pass gets a chance at it."""
+GENERAL_PRACTITIONER = "Your regular doctor"
+GENERAL_PRACTITIONER_CLINICAL = "General practitioner"
+
+GP_FIRST_REASON = "They know your history and can refer you on if a specialist is needed."
+
+
+def _match_lab_specialty(test_name: str) -> Optional[Tuple[str, str, str]]:
+    """Returns (plain_name, clinical_name, reason_fragment) for a test name the
+    rule table covers, else None — in which case the LLM pass gets a chance."""
     name = (test_name or "").lower()
-    for keywords, specialty, reason in LAB_SPECIALTY_RULES:
+    for keywords, plain, clinical, reason in LAB_SPECIALTY_RULES:
         for kw in keywords:
             # Word-boundary match so a short key like "alt" doesn't fire on
             # "Alkaline Phosphatase" or "Cobalt".
             if re.search(rf"\b{re.escape(kw)}\b", name):
-                return specialty, reason
+                return plain, clinical, reason
     return None
 
 
@@ -367,6 +424,33 @@ def _make_item(
             "finding being uncertain is a reason to confirm it, not to ignore it."
         )
     return item
+
+
+def _timing_block(dated: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Builds the same `timing` shape the cross-check findings carry, from a
+    finding that computed its own window (a guideline-flagged combination, a
+    double-dose period).
+
+    These are the most firmly dated findings in the report — their windows come
+    from arithmetic over treatment dates, not from a model — yet they used to
+    carry those dates only inside the prose `detail`. A client filtering or
+    sorting by `timing` therefore skipped exactly the findings it should have
+    surfaced first. Same field on every finding, so date handling can be
+    uniform.
+    """
+    return {
+        "status": dated.get("status") or "concurrent",
+        "window_start": dated.get("window_start"),
+        "window_end": dated.get("window_end"),
+        "overlap_days": dated.get("overlap_days", 0),
+        "gap_days": 0,
+        "note": (
+            f"Both were active {dated.get('window_start')} to {dated.get('window_end')}."
+            if dated.get("window_start") else
+            "The dates could not be established from the documents."
+        ),
+    }
 
 
 def _apply_timing(item: Dict[str, Any], finding: Dict[str, Any]) -> Dict[str, Any]:
@@ -452,6 +536,25 @@ def _items_from_cross_check(cross_check: Dict[str, Any]) -> List[Dict[str, Any]]
             confidence=_clamp_confidence(finding.get("confidence")),
         ), finding))
 
+    # Opioid + sedative prescribed over the same dates, cited to published
+    # guidance. Listed before the double-dose check because it is the one
+    # finding here that carries a real source behind it.
+    for combo in cross_check.get("guideline_flagged_combinations") or []:
+        window = ""
+        if combo.get("window_start"):
+            window = f" Both were active {combo['window_start']} to {combo['window_end']}."
+        citation = combo.get("citation") or {}
+        item = _make_item(
+            "guideline_flagged_combination",
+            subject=f"{combo.get('opioid')} + {combo.get('depressant')}",
+            detail=(combo.get("plain") or "") + window,
+            confidence=0.9,  # dated arithmetic plus a cited source
+        )
+        item["reference"] = citation
+        item["evidence_source"] = "reference_graph"
+        item["timing"] = _timing_block(combo)
+        items.append(item)
+
     # Periods where two live prescriptions supplied the same ingredient — the
     # double-dosing exposure the patient can hit without realising, since each
     # prescription looks reasonable on its own. Dated, so it says WHEN.
@@ -460,12 +563,14 @@ def _items_from_cross_check(cross_check: Dict[str, Any]) -> List[Dict[str, Any]]
         if exposure.get("cumulative_daily_dose") is not None and exposure.get("dosage_unit"):
             dose = (f" Combined that is {exposure['cumulative_daily_dose']} "
                     f"{exposure['dosage_unit']} per day.")
-        items.append(_make_item(
+        double_dose = _make_item(
             "concurrent_double_dose",
             subject=exposure.get("ingredient") or "unnamed ingredient",
             detail=(exposure.get("note") or "") + dose,
             confidence=0.9,  # arithmetic over dated records, not model inference
-        ))
+        )
+        double_dose["timing"] = _timing_block(exposure)
+        items.append(double_dose)
 
     return items
 
@@ -589,21 +694,32 @@ You are given a list of findings, each with an id, a short subject (a
 medication or lab test), and a description. For each one, name the single
 specialty best suited to it.
 
+THE PATIENT READS THIS. Write for someone with no medical training who wants
+one short, clear line — not a paragraph.
+- `specialty` must be what you would SAY to them: "Kidney specialist", "Heart
+  specialist", "Skin specialist", "Your regular doctor". Never the textbook
+  term — not "Nephrology", not "Dermatology". If the right answer is just
+  their usual doctor, say "Your regular doctor".
+- `clinical_name` is the matching professional term ("Nephrology",
+  "Dermatology", "General practitioner"), used for booking. Give both.
+- `reason` is ONE short sentence, maximum about 15 words, addressed to them
+  as "you" / "your". "Your creatinine test checks your kidneys." Not two
+  sentences, no hedging clauses, no restating the finding.
+- No abbreviations or clinical shorthand in `specialty` or `reason` — not
+  "INR", "CYP", "eGFR", "PRN", "monitoring", "medication review". If a term
+  would send someone to a search engine, replace it with what it means:
+  "your blood needs checking more often", not "you need INR monitoring".
+
 Rules:
-- Prefer a general practitioner / family doctor unless the finding clearly
-  belongs to one specialty. Most findings do not need a specialist, and a GP
-  is faster to reach, holds the whole record, and can refer onward. Naming a
+- Prefer their regular doctor unless the finding clearly belongs to one
+  specialty. Most findings do not need a specialist, and a regular doctor is
+  faster to reach, holds the whole record, and can refer onward. Naming a
   specialist unnecessarily sends the patient down a slower path.
-- Name a recognised specialty in plain English ("Nephrology", "Cardiology",
-  "General practitioner (family doctor)"). Never name an individual, a
-  hospital, or a clinic.
-- reason must say what about THIS finding points to that specialty, in one
-  sentence a patient can follow. Do not explain what the finding means
-  clinically and do not suggest what the treatment might be — you are routing,
-  not diagnosing.
-- Do not state or imply a diagnosis. "Liver-function tests are handled by
-  hepatology" is routing; "this suggests liver disease" is a diagnosis and is
-  not allowed.
+- Never name an individual, a hospital, or a clinic.
+- Do not explain what the finding means clinically and do not suggest
+  treatment — you are routing, not diagnosing. "Your ALT test checks your
+  liver" is routing; "this suggests liver disease" is a diagnosis and is not
+  allowed.
 
 CONFIDENCE SCORING — anchor every confidence value to these bands:
 - 0.90-1.00: the finding maps to exactly one discipline by long-standing
@@ -625,10 +741,11 @@ SPECIALTY_JSON_SCHEMA = {
                 "properties": {
                     "id": {"type": "integer"},
                     "specialty": {"type": "string"},
+                    "clinical_name": {"type": "string"},
                     "reason": {"type": "string"},
                     "confidence": {"type": "number"},
                 },
-                "required": ["id", "specialty", "reason", "confidence"],
+                "required": ["id", "specialty", "clinical_name", "reason", "confidence"],
                 "additionalProperties": False,
             },
         },
@@ -693,6 +810,7 @@ def _suggest_specialties_llm(
             continue
         out[idx] = {
             "specialty": specialty,
+            "clinical_name": (assignment.get("clinical_name") or "").strip() or None,
             "reason": (assignment.get("reason") or "").strip(),
             "confidence": _clamp_confidence(assignment.get("confidence"), default=0.5),
         }
@@ -718,24 +836,43 @@ def _assign_specialties(
         if item["route"] != "doctor":
             continue
 
+        if not _warrants_specialty(item):
+            # Still routed to a doctor — just not worth naming a KIND of
+            # doctor for. Recorded so the omission is explainable rather than
+            # looking like the specialty step silently failed.
+            item["specialty"] = None
+            item["specialty_omitted_because"] = (
+                "this finding was never a live risk, so there is nothing for a "
+                "specialist to act on"
+                if item.get("is_historical") else
+                "nothing here is outside the normal range and no safety issue was "
+                "found — a specialist is not indicated by this alone"
+            )
+            continue
+
         if item.get("lab_test"):
             matched = _match_lab_specialty(item["lab_test"])
             if matched:
-                specialty, reason = matched
+                plain, clinical, reason = matched
                 item["specialty"] = {
-                    "specialty": specialty,
-                    "reason": (
-                        f"{item['lab_test']} is usually handled by {specialty} because "
-                        f"{reason}. A general practitioner is still a valid first "
-                        "contact and can refer on."
-                    ),
+                    "specialty": plain,
+                    "clinical_name": clinical,
+                    # One line, in the second person, naming the test the
+                    # patient can see on their own report.
+                    "reason": f"Your {item['lab_test']} test {reason}.",
                     "confidence": 0.9,
                     "basis": "rule",
                 }
                 continue
         pending.append((idx, item))
 
-    assigned = _suggest_specialties_llm(pending, model=model) if use_llm else {}
+    # No qualifying finding means no specialty to name, and therefore no
+    # reason to spend an API call deciding one. Skipped explicitly rather than
+    # relying on the helper's own empty-input guard, so the saving is visible
+    # here where the decision is made.
+    assigned = (
+        _suggest_specialties_llm(pending, model=model) if (use_llm and pending) else {}
+    )
 
     for idx, item in pending:
         suggestion = assigned.get(idx)
@@ -744,6 +881,7 @@ def _assign_specialties(
         else:
             item["specialty"] = {
                 "specialty": GENERAL_PRACTITIONER,
+                "clinical_name": GENERAL_PRACTITIONER_CLINICAL,
                 "reason": GP_FIRST_REASON,
                 "confidence": 0.7,
                 "basis": "default",
@@ -764,6 +902,7 @@ def _collect_specialties(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         name = specialty_block["specialty"]
         entry = by_specialty.setdefault(name, {
             "specialty": name,
+            "clinical_name": specialty_block.get("clinical_name"),
             "reason": specialty_block["reason"],
             "confidence": specialty_block["confidence"],
             "basis": specialty_block["basis"],
@@ -915,13 +1054,38 @@ def triage_consultation(
 
     specialties = _collect_specialties(items)
 
+    # One line, plain, imperative — what to do and by when. Everything else in
+    # this result is detail behind it.
+    if not items:
+        headline = "Nothing to act on right now."
+    elif consult_type == "doctor":
+        who = specialties[0]["specialty"].lower() if specialties else "a doctor"
+        if specialties and specialties[0]["specialty"] == GENERAL_PRACTITIONER:
+            who = "your regular doctor"
+        headline = f"See {who} {URGENCY_WHEN[urgency]}."
+    else:
+        headline = f"Speak to a pharmacist {URGENCY_WHEN[urgency]}."
+
+    # Explains an empty specialty list when a doctor IS still recommended, so
+    # a caller can tell "we didn't name one because none is warranted" apart
+    # from "the specialty step failed".
+    specialty_note = None
+    if doctor_items and not specialties:
+        specialty_note = (
+            "No particular kind of doctor is suggested: nothing here is a safety "
+            "problem or an out-of-range result, so a general appointment is the right "
+            "place to raise it."
+        )
+
     return {
         "consult_needed": bool(items),
+        "headline": headline,
         "consult_type": consult_type,
         "urgency": urgency,
         "urgency_meaning": URGENCY_MEANING[urgency] if urgency else None,
         "confidence": round(confidence, 2),
         "recommended_specialties": specialties,
+        "specialty_note": specialty_note,
         "pharmacist_actions": pharmacist_items,
         "doctor_actions": doctor_items,
         "referral_items": items,
@@ -1008,9 +1172,23 @@ if __name__ == "__main__":
     assert labs["consult_type"] == "doctor"
     assert labs["urgency"] == "soon"          # the ALT crossing, not the Creatinine drift
     by_specialty = {s["specialty"]: s for s in labs["recommended_specialties"]}
-    assert "Hepatology (or Gastroenterology)" in by_specialty, by_specialty
-    assert "Nephrology" in by_specialty, by_specialty
-    assert by_specialty["Hepatology (or Gastroenterology)"]["basis"] == "rule"
+    # ALT actually crossed out of range — a real finding, so a specialty is named.
+    assert "Liver specialist" in by_specialty, by_specialty
+    liver = by_specialty["Liver specialist"]
+    assert liver["basis"] == "rule"
+    # Plain name on screen, clinical term kept alongside for booking.
+    assert liver["clinical_name"] == "Hepatology / Gastroenterology"
+    # One short line, addressed to the patient.
+    assert liver["reason"] == "Your ALT test checks your liver.", liver["reason"]
+    assert len(liver["reason"].split()) <= 12
+    # Creatinine is still INSIDE its range, merely drifting toward the edge. It
+    # stays on the referral list, but naming a nephrologist for a normal result
+    # overstates it — see _warrants_specialty().
+    assert "Kidney specialist" not in by_specialty, by_specialty
+    drift_item = next(i for i in labs["referral_items"]
+                      if i["trigger"] == "lab_approaching_threshold")
+    assert drift_item["specialty"] is None
+    assert drift_item["specialty_omitted_because"]
     # The stable in-range test must produce no referral at all.
     assert all(i["subject"] != "Vitamin B12" for i in labs["referral_items"])
     # Most urgent first: the crossing outranks the drift.
@@ -1018,7 +1196,7 @@ if __name__ == "__main__":
 
     # Word-boundary guard: "ALP"/"ALT" keys must not fire on unrelated names.
     assert _match_lab_specialty("Cobalt") is None
-    assert _match_lab_specialty("Alkaline Phosphatase")[0].startswith("Hepatology")
+    assert _match_lab_specialty("Alkaline Phosphatase")[0] == "Liver specialist"
 
     # --- Case 4: low confidence lowers the score but NEVER the urgency -----
     low_conf = triage_consultation(
@@ -1163,6 +1341,121 @@ if __name__ == "__main__":
     assert exposure_item["urgency"] == "urgent", exposure_item
     assert exposure_item["route"] == "pharmacist"
     assert "5000.0 mg per day" in exposure_item["detail"], exposure_item["detail"]
+
+    # --- Case 7e: a specialty is named only when something warrants it -----
+    # A lab still inside its normal range, merely drifting toward the edge.
+    # Worth raising at a routine appointment; not worth naming a specialist.
+    drifting_only = triage_consultation(
+        cross_check={},
+        lab_trends={"trends": [
+            {"test_name": "LDL Cholesterol", "confidence": 0.94,
+             "explanation": "Still in range but climbing.",
+             "crossed_into_abnormal_at": None, "approaching_threshold": True,
+             "data_points": [{"flag": "normal"}, {"flag": "normal"}]},
+        ]},
+        use_llm=False,
+    )
+    assert drifting_only["consult_needed"] is True
+    assert drifting_only["consult_type"] == "doctor"
+    assert drifting_only["urgency"] == "routine"
+    assert drifting_only["recommended_specialties"] == [], drifting_only["recommended_specialties"]
+    assert drifting_only["specialty_note"], "an empty list needs explaining"
+    assert drifting_only["referral_items"][0]["specialty"] is None
+    assert "not outside the normal range" in drifting_only["referral_items"][0][
+        "specialty_omitted_because"].replace("nothing here is outside", "not outside")
+
+    # The same test once it has actually crossed IS an alert, and does get one.
+    crossed = triage_consultation(
+        cross_check={},
+        lab_trends={"trends": [
+            {"test_name": "LDL Cholesterol", "confidence": 0.94,
+             "explanation": "Crossed high.",
+             "crossed_into_abnormal_at": {"date": "2026-03-01", "flag": "high"},
+             "approaching_threshold": False,
+             "data_points": [{"flag": "normal"}, {"flag": "high"}]},
+        ]},
+        use_llm=False,
+    )
+    assert [s["specialty"] for s in crossed["recommended_specialties"]] == [
+        "Heart specialist"], crossed["recommended_specialties"]
+
+    # --- Every patient-facing string stays short and jargon-free -----------
+    for result in (crossed, labs, allergy, pharmacist_only):
+        assert result["headline"], result
+        assert len(result["headline"]) <= 70, result["headline"]
+        for spec in result["recommended_specialties"]:
+            assert len(spec["reason"].split()) <= 18, spec["reason"]
+            for jargon in ("Hepatology", "Nephrology", "Cardiology", "Endocrinology",
+                           "Haematology", "Urology", "Rheumatology",
+                           "General practitioner (family"):
+                assert jargon not in spec["specialty"], spec["specialty"]
+
+    assert crossed["headline"] == "See heart specialist in the next few days.", crossed["headline"]
+    assert pharmacist_only["headline"] == "Speak to a pharmacist in the next few days."
+    assert allergy["headline"] == "See your regular doctor today or tomorrow.", allergy["headline"]
+    assert clean["headline"] == "Nothing to act on right now."
+
+    # A historical pairing names no specialty, however severe it sounds —
+    # courses that never overlapped leave nothing for a specialist to act on.
+    historical_only = triage_consultation(
+        cross_check={"potential_drug_interactions": [
+            {"medications_involved": ["Cetirizine", "Chlorpheniramine"],
+             "explanation": "Additive sedation.", "severity": "high", "confidence": 0.6,
+             "timing": {"status": "not_concurrent", "window_start": None,
+                        "window_end": None, "overlap_days": 0, "gap_days": 861,
+                        "note": "…"}},
+        ]},
+        use_llm=False,
+    )
+    assert historical_only["recommended_specialties"] == [], historical_only
+    assert historical_only["referral_items"][0]["is_historical"] is True
+
+    # A genuine, current interaction still gets one.
+    live_alert = triage_consultation(
+        cross_check={"potential_drug_interactions": [
+            {"medications_involved": ["Warfarin", "Amiodarone"],
+             "explanation": "Bleeding risk.", "severity": "high", "confidence": 0.8,
+             "timing": {"status": "concurrent", "window_start": "2026-01-01",
+                        "window_end": "2026-01-14", "overlap_days": 14,
+                        "gap_days": 0, "note": "…"}},
+        ]},
+        use_llm=False,
+    )
+    assert len(live_alert["recommended_specialties"]) == 1, live_alert
+    assert live_alert["specialty_note"] is None
+
+    # Nothing found at all -> no doctor, no specialty (unchanged behaviour).
+    nothing = triage_consultation(cross_check={}, use_llm=False)
+    assert nothing["recommended_specialties"] == []
+    assert nothing["specialty_note"] is None
+
+    # --- Case 7f: a guideline-backed combination is cited, not capped ------
+    guideline = triage_consultation(
+        cross_check={"guideline_flagged_combinations": [
+            {"opioid": "Oxycodone", "depressant": "Diazepam", "status": "concurrent",
+             "window_start": "2025-11-12", "window_end": "2025-11-22",
+             "overlap_days": 11, "severity": "high",
+             "plain": "Taking a strong painkiller together with a sedative can "
+                      "dangerously slow your breathing.",
+             "citation": {"source": "SAMHSA Overdose Prevention and Response Toolkit",
+                          "page": 13, "publication_no": "PEP23-03-00-001"}},
+        ]},
+        use_llm=False,
+    )
+    assert len(guideline["referral_items"]) == 1
+    combo_item = guideline["referral_items"][0]
+    assert combo_item["trigger"] == "guideline_flagged_combination"
+    assert combo_item["route"] == "doctor" and combo_item["urgency"] == "urgent"
+    assert combo_item["confidence"] == 0.9, "a cited claim is not capped at 0.6"
+    assert combo_item["reference"]["page"] == 13
+    assert "2025-11-12 to 2025-11-22" in combo_item["detail"], combo_item["detail"]
+    # Dates must also be structured, not only in the prose — a client filtering
+    # by `timing` should not miss the most firmly dated finding in the report.
+    assert combo_item["timing"]["status"] == "concurrent", combo_item["timing"]
+    assert combo_item["timing"]["window_start"] == "2025-11-12"
+    assert combo_item["timing"]["overlap_days"] == 11
+    # It is a genuine alert, so naming a kind of doctor IS warranted.
+    assert guideline["recommended_specialties"], guideline
 
     # --- Case 8: an unrecognised severity must not silently vanish ---------
     odd_severity = triage_consultation(

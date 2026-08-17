@@ -629,6 +629,19 @@ def _render_safety_flags(cross_check: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _render_reference_guidance(timeline: Dict[str, Any]) -> str:
+    """Injects published clinical guidance that applies to this patient's
+    medication list (see reference_library.py), with source and page.
+
+    Kept separate from the patient's own findings on purpose: this is
+    established guidance the answer may state as fact and cite, whereas a
+    cross-check finding is a claim ABOUT this person. Returns "" when nothing
+    applies, so a record with no opioid never carries opioid guidance."""
+    from reference_library import render_reference_guidance
+
+    return render_reference_guidance(timeline)
+
+
 def _render_consult_routing(triage: Dict[str, Any]) -> str:
     """Surfaces the already-computed consultation routing (see
     consult_triage.py) so an answer about "should I see someone?" reflects
@@ -750,6 +763,7 @@ def build_full_context(record: Dict[str, Any]) -> str:
         _render_clinical_notes(timeline),
         _render_safety_flags(record.get("cross_check_report") or {}),
         _render_consult_routing(record.get("consult_triage") or {}),
+        _render_reference_guidance(timeline),
     ])
 
 
@@ -948,6 +962,11 @@ def build_planned_context(
              "text": _render_safety_flags(record.get("cross_check_report") or {})},
             {"label": "CONSULTATION ROUTING", "mandatory": True,
              "text": _render_consult_routing(record.get("consult_triage") or {})},
+            # Mandatory: it only appears when a genuinely high-risk combination
+            # is on file, and trimming the one cited safety source to save
+            # space would leave the answer relying on uncited recall instead.
+            {"label": "PUBLISHED GUIDANCE", "mandatory": True,
+             "text": _render_reference_guidance(timeline)},
         ],
         budget_chars,
     )
@@ -1030,6 +1049,11 @@ RULES:
 - Whenever the question touches risk, drug interactions, allergy conflicts,
   or changing/adjusting a dosage, explicitly recommend consulting a doctor or
   pharmacist and set recommend_professional_consult to true.
+- A "PUBLISHED GUIDANCE" section, when present, is established clinical
+  guidance from a named source — not a claim about this patient. You may state
+  it as fact, and should name the source and page when you rely on it ("SAMHSA's
+  overdose toolkit, page 13"). Never present it as something found in their
+  records, and never extend it beyond what the quote says.
 - Safety findings carry TIMING. A finding marked NEVER TAKEN TOGETHER must be
   described as history, not as a current risk — say the two courses did not
   overlap and give the dates. For one marked TAKEN TOGETHER, state the period

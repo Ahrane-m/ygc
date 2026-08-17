@@ -312,6 +312,33 @@ def ensure_constraints() -> None:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (s:SourceDocument) "
             "REQUIRE s.filename IS UNIQUE"
         ),
+        # Published clinical guidance (see guidance_kg.py). Shares the
+        # :Medicine nodes above, so the two reference sources join rather
+        # than sitting in parallel.
+        "GuidanceSource.id unique": (
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (s:GuidanceSource) REQUIRE s.id IS UNIQUE"
+        ),
+        "Guidance.id unique": (
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (g:Guidance) REQUIRE g.id IS UNIQUE"
+        ),
+        "DrugClass.name unique": (
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (c:DrugClass) REQUIRE c.name IS UNIQUE"
+        ),
+        # Full WHO Essential Medicines List (eml_kg.py). Section ids are
+        # scoped by population because "2.2" means a different thing in the
+        # adult list and the children's list.
+        "Section.id unique": (
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Section) REQUIRE s.id IS UNIQUE"
+        ),
+        "Indication.name unique": (
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (i:Indication) REQUIRE i.name IS UNIQUE"
+        ),
+        "AWaReGroup.name unique": (
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (g:AWaReGroup) REQUIRE g.name IS UNIQUE"
+        ),
+        "AgeRestriction.id unique": (
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (r:AgeRestriction) REQUIRE r.id IS UNIQUE"
+        ),
     }
     with session_scope("ensure_constraints") as session:
         for step, cypher in constraints.items():

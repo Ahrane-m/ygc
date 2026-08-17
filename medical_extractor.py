@@ -962,6 +962,20 @@ def detect_exact_duplicate_medications(timeline: Dict[str, Any]) -> List[Dict[st
     return duplicates
 
 
+# Bump whenever cross_check_prescriptions() changes what it PRODUCES — a new
+# finding type, a new annotation stage, a changed grading rule.
+#
+# The fingerprint below exists to skip a ~44s model call when the inputs are
+# unchanged. But "same inputs" only implies "same answer" while the analysis
+# itself is unchanged: after adding the guideline check, a snapshot saved
+# before it was written matched on inputs and was reused verbatim, so the new
+# opioid-plus-sedative finding never appeared for any existing patient until
+# something happened to change their medication list. Folding this version
+# into the hash makes every stored snapshot miss once after a change, recompute,
+# and then reuse normally.
+CROSS_CHECK_ANALYSIS_VERSION = "2026-08-16.guideline-reference"
+
+
 def cross_check_inputs_fingerprint(timeline: Dict[str, Any]) -> str:
     """
     Hash of exactly what cross_check_prescriptions() sends to the model.
@@ -979,6 +993,7 @@ def cross_check_inputs_fingerprint(timeline: Dict[str, Any]) -> str:
     fingerprint changing with them.
     """
     payload = {
+        "analysis_version": CROSS_CHECK_ANALYSIS_VERSION,
         "medications_timeline": timeline.get("medications_timeline") or [],
         "known_allergies": timeline.get("known_allergies") or [],
     }
@@ -1098,8 +1113,12 @@ def cross_check_prescriptions(
     # Grading caps and flags the ungrounded ones, which is what this pipeline
     # already tells users it is (a reasoning layer, not a validated
     # drug-interaction database).
+    # Published guidance is consulted before the confidence cap is applied, so
+    # a claim a real source actually makes keeps its weight and cites a page,
+    # instead of being capped alongside the model's unverifiable recall.
     from evidence_grading import grade_cross_check
-    grade_cross_check(result, graph_backed_findings)
+    from reference_library import samhsa_claim_reference
+    grade_cross_check(result, graph_backed_findings, claim_reference=samhsa_claim_reference)
 
     # Place every finding in time. Two drugs only interact if the patient was
     # taking them at the same time, and the model compares a flat list with no
@@ -1110,6 +1129,12 @@ def cross_check_prescriptions(
     from risk_timeline import annotate_findings_with_timing, concurrent_exposure
     annotate_findings_with_timing(result, timeline)
     result["concurrent_exposure"] = concurrent_exposure(timeline)
+
+    # Dated opioid + sedative overlap, cited to published guidance. Uses the
+    # treatment windows rather than mere co-presence, so a course that ended
+    # long before the other began is not reported as a live risk.
+    from reference_library import find_concurrent_depressant_risk
+    result["guideline_flagged_combinations"] = find_concurrent_depressant_risk(timeline)
 
     return result
 

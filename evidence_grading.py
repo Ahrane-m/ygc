@@ -47,7 +47,7 @@ the hook to raise findings to `reference_graph` as real interaction reference
 data is ingested.
 """
 
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 # Ungrounded findings are capped here. Matches retrieval.LOW_CONFIDENCE_THRESHOLD
 # so "low confidence" means one thing across the product — and so the existing
@@ -100,6 +100,7 @@ def _finding_drug_names(finding: Dict[str, Any]) -> Set[str]:
 def grade_finding(
     finding: Dict[str, Any],
     graph_backed_findings: Optional[Dict[str, Dict[str, Any]]] = None,
+    claim_reference: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """
     Grades one finding in place and returns it.
@@ -119,6 +120,21 @@ def grade_finding(
         finding["grounded"] = True
         finding.setdefault("evidence_note", DETERMINISTIC_NOTE)
         return finding
+
+    # A published source that makes THIS claim outranks a per-drug graph hit:
+    # it evidences the finding itself, not merely that the drug appears
+    # somewhere in a reference document.
+    if claim_reference is not None:
+        citation = claim_reference(finding)
+        if citation:
+            finding["evidence_source"] = REFERENCE_GRAPH
+            finding["grounded"] = True
+            finding["reference"] = citation
+            finding["evidence_note"] = (
+                "Backed by published clinical guidance, quoted and cited below — not "
+                "the model's own recollection."
+            )
+            return finding
 
     graph_backed_findings = graph_backed_findings or {}
     matched = {
@@ -157,6 +173,7 @@ def grade_finding(
 def grade_cross_check(
     cross_check: Dict[str, Any],
     graph_backed_findings: Optional[Dict[str, Dict[str, Any]]] = None,
+    claim_reference: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """
     Grades every finding in a cross_check report, in place, and adds an
@@ -173,7 +190,7 @@ def grade_cross_check(
         for finding in cross_check.get(list_name) or []:
             if not isinstance(finding, dict):
                 continue
-            grade_finding(finding, graph_backed_findings)
+            grade_finding(finding, graph_backed_findings, claim_reference)
             counts[finding["evidence_source"]] += 1
 
     total = sum(counts.values())
