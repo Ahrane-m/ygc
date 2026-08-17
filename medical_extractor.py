@@ -986,6 +986,49 @@ def cross_check_inputs_fingerprint(timeline: Dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _source_documents_for_medication(
+    name: str, medications_timeline: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Resolves a medication name — as echoed back by the cross-check LLM in
+    `potential_drug_interactions`/`allergy_conflicts`, which has no per-item
+    source field of its own — to the document(s) it was actually extracted
+    from, by matching against both `name` and `ingredients` on every
+    timeline entry. Exact (case-insensitive) match first; only falls back to
+    substring match if nothing matched exactly, since a brand name and its
+    generic ("Panadol" vs "Paracetamol") can appear in the same finding.
+
+    Identifies each source by (date, source_file) — the prescription's own
+    date and the document it came from — rather than any internal hash, so
+    the result is directly meaningful to a reader.
+    """
+    target = (name or "").strip().lower()
+    if not target:
+        return []
+
+    def _candidates(med: Dict[str, Any]) -> List[str]:
+        return [c.lower() for c in [med.get("name")] + list(med.get("ingredients") or []) if c]
+
+    for exact in (True, False):
+        seen = set()
+        sources: List[Dict[str, Any]] = []
+        for med in medications_timeline:
+            candidates = _candidates(med)
+            matched = target in candidates if exact else any(
+                target in c or c in target for c in candidates
+            )
+            if not matched:
+                continue
+            key = (med.get("date"), med.get("source_file"))
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append({"date": med.get("date"), "source_file": med.get("source_file")})
+        if sources:
+            return sources
+    return []
+
+
 def cross_check_prescriptions(
     timeline: Dict[str, Any],
     model: str = MODEL,
@@ -1016,6 +1059,26 @@ def cross_check_prescriptions(
         response_format=CROSS_CHECK_RESPONSE_FORMAT,
     )
     result = json.loads(response.choices[0].message.content)
+
+    # potential_drug_interactions and allergy_conflicts carry only free-text
+    # drug names in their JSON shape, not a source field — resolved here
+    # deterministically against the timeline rather than trusting the model
+    # to echo document identifiers for a name it may reword.
+    medications_timeline = timeline.get("medications_timeline") or []
+    for finding in result.get("potential_drug_interactions", []):
+        seen = set()
+        sources: List[Dict[str, Any]] = []
+        for drug in finding.get("medications_involved", []):
+            for src in _source_documents_for_medication(drug, medications_timeline):
+                key = (src["date"], src["source_file"])
+                if key not in seen:
+                    seen.add(key)
+                    sources.append(src)
+        finding["source_documents"] = sources
+    for finding in result.get("allergy_conflicts", []):
+        finding["source_documents"] = _source_documents_for_medication(
+            finding.get("medication", ""), medications_timeline
+        )
 
     deterministic_duplicates = detect_exact_duplicate_medications(timeline)
     existing = result.setdefault("duplicate_prescriptions", [])
