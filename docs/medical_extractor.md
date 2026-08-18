@@ -33,9 +33,12 @@ Module-level constants:
   "allergies_noted": [string],
   "clinical_notes": string | null,
   "illegible_or_low_confidence_fields": [string],
+  "extraction_notes": [string],
   "overall_confidence": number
 }
 ```
+
+`illegible_or_low_confidence_fields` and `extraction_notes` look similar and are not interchangeable. The first is for fields that could not be **read** — a clearer scan would have helped. The second is for fields read fine but **interpreted** to fit the schema (a combination product recorded as one component, a frequency phrase converted to a number). `consult_triage.py` treats the first as grounds to distrust the extracted medication list, so anything filed there that was actually legible produces a spurious "check this with a pharmacist".
 
 If you need to add a field, update `EXTRACTION_JSON_SCHEMA` **and** the `"required"` list — with `strict: True` a field missing from `required` will error, not just be optional.
 

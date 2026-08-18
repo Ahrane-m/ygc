@@ -51,6 +51,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from openai import OpenAIError
 
 from medical_extractor import client, MODEL
+from reference_intervals import canonical_test
 
 CHAT_MODEL = MODEL      # reuse the same chat model configured in medical_extractor.py
 PLANNER_MODEL = MODEL   # only called when a record exceeds the context budget
@@ -236,22 +237,38 @@ def _distinct_progression(values: List[str]) -> List[str]:
 
 def group_lab_results(timeline: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Rolls the flat lab_results_timeline up into one group per test name
-    (case-insensitively), chronologically ordered, so a multi-document
-    series reads as a series instead of scattered readings.
+    Rolls the flat lab_results_timeline up into one group per test,
+    chronologically ordered, so a multi-document series reads as a series
+    instead of scattered readings.
+
+    Grouped on reference_intervals.canonical_test() — the SAME key
+    lab_trends.py groups on — so that a test printed as "Fasting Glucose" on
+    one report and "FBS" on the next forms one group here too. Keying on the
+    printed name (as this used to) split it into two, and the trend computed
+    over both readings would then attach to a group displaying only one of
+    them, with the text saying "the 2 times this was tested" beside a single
+    row. Tests outside that table still fall back to their lowercased name.
     """
     groups: Dict[str, List[Dict[str, Any]]] = {}
     display: Dict[str, str] = {}
+    names_seen: Dict[str, List[str]] = {}
     for lab in timeline.get("lab_results_timeline", []):
         name = (lab.get("test_name") or "unknown test").strip()
-        key = name.lower()
+        key = canonical_test(name) or name.lower()
         groups.setdefault(key, []).append(lab)
         display.setdefault(key, name)
+        if name not in names_seen.setdefault(key, []):
+            names_seen[key].append(name)
 
     rolled = [
         {
             "key": key,
             "test_name": display[key],
+            # Every spelling this test appeared under. The planner selects
+            # against the record vocabulary, which lists the raw printed
+            # names, so a question about "FBS" has to keep matching a group
+            # now displayed as "Fasting Glucose".
+            "names": names_seen[key],
             "results": _sort_by_date(labs),
             "source_files": [l.get("source_file") for l in _sort_by_date(labs) if l.get("source_file")],
             "has_abnormal": any((l.get("flag") or "").lower() in ("high", "low") for l in labs),
@@ -448,7 +465,11 @@ def _render_medications(groups: Sequence[Dict[str, Any]], omitted: Sequence[str]
     return "\n".join(lines)
 
 
-def _render_lab_group(group: Dict[str, Any], trend: Optional[Dict[str, Any]]) -> str:
+def _render_lab_group(
+    group: Dict[str, Any],
+    trend: Optional[Dict[str, Any]],
+    single: Optional[Dict[str, Any]] = None,
+) -> str:
     results = group["results"]
     latest = results[-1]
     unit = latest.get("unit") or ""
@@ -475,6 +496,23 @@ def _render_lab_group(group: Dict[str, Any], trend: Optional[Dict[str, Any]]) ->
             lines.append("    APPROACHING a reference-range boundary.")
         if trend.get("explanation"):
             lines.append(f"    PLAIN LANGUAGE: {trend['explanation']}")
+    elif single:
+        # One reading, so no trend — but lab_trends still worked out whether
+        # the value sits low, normal or high. Without this a question like
+        # "is my hemoglobin ok?" would reach the model as a bare number.
+        basis = {
+            "report": "against the range printed on the report",
+            "general": (
+                "against a general range for this patient's age and sex, NOT the "
+                "range their own laboratory uses"
+            ),
+        }.get(single.get("range_source"), "no range was available to compare against")
+        lines.append(
+            f"    SINGLE RESULT (no earlier reading to compare with) — status: "
+            f"{single.get('status')}, assessed {basis}."
+        )
+        if single.get("explanation"):
+            lines.append(f"    PLAIN LANGUAGE: {single['explanation']}")
     return "\n".join(lines)
 
 
@@ -486,11 +524,19 @@ def _render_labs(
     if not groups and not omitted:
         return "LAB RESULTS: none recorded in any document on file."
 
-    trends_by_test = {
-        (t.get("test_name") or "").lower(): t for t in (lab_trends.get("trends") or [])
-    }
+    # Keyed the same way group_lab_results() keys its groups -- canonical id
+    # where there is one, lowercased printed name otherwise -- so a trend
+    # computed over "Fasting Glucose" + "FBS" lands on the group holding both.
+    def _trend_key(entry):
+        return entry.get("test_id") or (entry.get("test_name") or "").lower()
+
+    trends_by_test = {_trend_key(t): t for t in (lab_trends.get("trends") or [])}
+    singles_by_test = {_trend_key(s): s for s in (lab_trends.get("single_results") or [])}
     lines = [f"LAB RESULTS (grouped by test across all documents, {len(groups)} distinct):"]
-    lines.extend(_render_lab_group(g, trends_by_test.get(g["key"])) for g in groups)
+    lines.extend(
+        _render_lab_group(g, trends_by_test.get(g["key"]), singles_by_test.get(g["key"]))
+        for g in groups
+    )
 
     insufficient = lab_trends.get("insufficient_data") or []
     if insufficient:
@@ -650,14 +696,35 @@ def _render_consult_routing(triage: Dict[str, Any]) -> str:
     if not triage:
         return "CONSULTATION ROUTING: not yet computed for this patient."
 
+    # Documents that scanned badly. Reported in both branches below, because
+    # "was my prescription read correctly?" is a fair question whether or not
+    # anything clinical was found — but always as a note about the PAPERWORK,
+    # so the answering model does not turn a blurry scan into a referral. See
+    # DATA_QUALITY_TRIGGERS in consult_triage.py.
+    quality_lines = []
+    for notice in triage.get("document_quality_notices") or []:
+        quality_lines.append(
+            f"- DOCUMENT QUALITY (not a clinical finding, not a reason to consult "
+            f"anyone): {notice.get('subject')} — {notice.get('detail')}"
+        )
+
     if not triage.get("consult_needed"):
-        return (
+        base = (
             "CONSULTATION ROUTING: no automated trigger for a consultation was found. "
             "State plainly that this is NOT a clean bill of health — it means only that "
             "these specific checks found nothing in the uploaded documents, and the "
             "patient should still raise any symptom or concern with their doctor or "
             "pharmacist."
         )
+        if quality_lines:
+            base += (
+                "\nSome uploaded documents could not be read with full confidence. "
+                "Mention this only if asked about the documents themselves, and say "
+                "it means the details are worth checking against the original "
+                "paperwork — not that the patient needs an appointment.\n"
+                + "\n".join(quality_lines)
+            )
+        return base
 
     lines = [
         f"CONSULTATION ROUTING (already computed): consult a "
@@ -681,6 +748,7 @@ def _render_consult_routing(triage: Dict[str, Any]) -> str:
             f"confidence {item.get('confidence')}): {item.get('subject')}{caveat}"
         )
 
+    lines.extend(quality_lines)
     lines.append(f"- Why this routing: {triage.get('summary')}")
     return "\n".join(lines)
 
@@ -924,7 +992,7 @@ def build_planned_context(
             g for g in med_groups
             if _selects([g["display_name"], *g["ingredients"]], selected_meds)
         ]
-        kept_labs = [g for g in lab_groups if _selects([g["test_name"]], selected_labs)]
+        kept_labs = [g for g in lab_groups if _selects(g["names"], selected_labs)]
         # A risk question about specific drugs still needs the whole
         # medication list — you cannot check an interaction against drugs
         # you were not shown.

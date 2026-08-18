@@ -184,9 +184,32 @@ to a different family member's profile). Populate them conservatively:
 - These fields are for identity-mismatch detection only — never let them
   influence document_type, medications, or lab_results extraction.
 
+TWO KINDS OF CAVEAT, TWO DIFFERENT FIELDS — downstream code treats these
+very differently, so putting a note in the wrong one has real consequences.
+
+- illegible_or_low_confidence_fields: ONLY for fields you could not READ.
+  Handwriting you had to guess at, text that is blurred, smudged, cut off,
+  obscured, or missing from the image. The test is: would a clearer scan or
+  photo of this document have given you a better answer? If yes, it belongs
+  here. Naming the field is what matters ("dosage for Metformin was
+  smudged"), because a reader has to go back to the paper to resolve it.
+
+- extraction_notes: for everything you DID read successfully but had to
+  interpret, normalize, simplify or reshape to fit this schema. A
+  combination product recorded as one of its components, a frequency phrase
+  converted to a number, a quantity present on the page but not repeated
+  per-item, a brand name mapped to its generic. Nothing is wrong in these
+  cases — you are recording a decision you made, for transparency.
+
+Do NOT put a note in illegible_or_low_confidence_fields for something you
+read perfectly well. A field you could read is not an illegible field, no
+matter how much explaining your handling of it needs.
+
 Rules:
 - If handwriting is unclear, make your best guess but LOWER the confidence
-  score for that field and add a note to illegible_or_low_confidence_fields.
+  score for that field and add a note to illegible_or_low_confidence_fields
+  (see the split immediately above — read-but-reshaped goes in
+  extraction_notes instead).
 - Never invent data. Use null for missing string fields (per the schema).
 - Do not provide medical advice or diagnosis — extraction only.
 """
@@ -252,7 +275,14 @@ EXTRACTION_JSON_SCHEMA = {
         },
         "allergies_noted": {"type": "array", "items": {"type": "string"}},
         "clinical_notes": {"type": ["string", "null"]},
+        # Fields that could not be READ. Consumed by consult_triage.py, which
+        # treats a non-empty list as a reason to distrust the extracted
+        # medication list — so it must not collect anything else.
         "illegible_or_low_confidence_fields": {"type": "array", "items": {"type": "string"}},
+        # Fields read fine but interpreted, normalized or reshaped to fit this
+        # schema. Transparency only: nothing downstream treats these as a
+        # problem. Exists so the model has somewhere correct to put them.
+        "extraction_notes": {"type": "array", "items": {"type": "string"}},
         "overall_confidence": {"type": "number"},
         "ocr_confidence": {"type": "number"},
         "translation_confidence": {"type": ["number", "null"]},
@@ -262,7 +292,8 @@ EXTRACTION_JSON_SCHEMA = {
         "provider_or_doctor", "patient_name",
         "patient_age", "patient_gender",
         "medications", "lab_results", "allergies_noted", "clinical_notes",
-        "illegible_or_low_confidence_fields", "overall_confidence",
+        "illegible_or_low_confidence_fields", "extraction_notes",
+        "overall_confidence",
         "ocr_confidence", "translation_confidence",
     ],
     "additionalProperties": False,
@@ -1362,6 +1393,15 @@ if __name__ == "__main__":
                 print(f"    - {specialty['specialty']} (for: {', '.join(specialty['triggered_by'])})")
         else:
             print("  CONSULT: no automated trigger found (not a clean bill of health)")
+
+        # Printed separately from CONSULT because it is not one: these are
+        # documents worth re-checking against the original paperwork, not a
+        # reason to see anyone.
+        notices = triage.get("document_quality_notices") or []
+        if notices:
+            print(f"  DOCUMENT QUALITY: {len(notices)} document(s) need re-checking")
+            for notice in notices:
+                print(f"    - {notice['subject']}")
 
     # Step 5 (optional): interactive Q&A over whatever was just indexed.
     if chat_mode:

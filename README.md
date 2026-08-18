@@ -149,7 +149,7 @@ curl http://127.0.0.1:8000/api/v1/health
 
 ### Documents & Timeline
 
-#### `POST /api/v1/documents`
+#### `POST st p`
 
 Uploads one or more files (`multipart/form-data`, field name `files`) for
 the authenticated user. Extracts each, archives the original file to
@@ -193,6 +193,7 @@ Response `201`:
         "allergies_noted": ["Penicillin"],
         "clinical_notes": "Patient presented with sinus infection.",
         "illegible_or_low_confidence_fields": [],
+        "extraction_notes": [],
         "overall_confidence": 0.93,
         "_source": {"file": "prescription_march.pdf", "method": "text_layer"},
         "document_url": "https://res.cloudinary.com/.../mediscan/6620a1f2.../prescription_march_pdf_a1b2c3d4.pdf",
@@ -259,10 +260,13 @@ Response `201`:
         "urgency": "urgent",
         "why_this_route": "A medication on file conflicts with an allergy recorded in these same documents. Resolving it means changing or substituting the prescription, which is a prescribing decision.",
         "confidence": 0.9,
+        "category": "clinical",
         "specialty": { "...": "..." }
       }
     ],
-    "referral_items": [ { "...": "every item above, most urgent first" } ],
+    "referral_items": [ { "...": "every clinical item above, most urgent first" } ],
+    "document_quality_notices": [ { "...": "documents that scanned badly — never a referral" } ],
+    "document_quality_note": null,
     "summary": "A doctor should be consulted — make contact today or tomorrow…",
     "emergency_advice": "…anyone with severe or sudden symptoms should seek emergency care immediately…",
     "note": "…routing suggestion, not a diagnosis…"
@@ -276,6 +280,18 @@ is **not** a clean bill of health, and both the `summary` and `note` fields
 say so explicitly. The module never de-escalates: a low `confidence` lowers
 the score but never the `urgency`, because an uncertain allergy conflict is
 a reason to confirm it, not to ignore it.
+
+Two separate streams come back. `referral_items` (and the
+`pharmacist_actions` / `doctor_actions` split of it) holds findings about the
+**patient**, and only these set `consult_needed`, `consult_type` and
+`urgency`. `document_quality_notices` holds findings about the **documents** —
+a scan too poor to trust the medication list built from it. Those are
+reported, never counted as a referral: "one field on your scan was hard to
+read" is not a reason to send someone to a pharmacist, and doing so teaches
+people to ignore the times it says something real. The single exception is a
+document whose drug names were translated from another language with low
+confidence — that record looks correct and may not be, so it stays a genuine
+pharmacist referral.
 
 If indexing fails (e.g. embeddings API error), `indexed: false` and an
 `index_error` field are included instead — the timeline/cross-check are
