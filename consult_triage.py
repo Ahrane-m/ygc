@@ -287,36 +287,40 @@ ROUTING_RULES: Dict[Tuple[str, Optional[str]], Dict[str, str]] = {
 # this table is deliberately short rather than exhaustive.
 # ---------------------------------------------------------------------------
 
-# (keywords, what to call it to a patient, the clinical name, one short line)
+# (keywords, the specialist's professional title, a plain gloss, one short line)
 #
-# The patient-facing name comes first because it is the one that gets shown.
-# Someone reading their own results does not know what hepatology is, and a
-# label you have to look up is a label you skip. The clinical name is kept
-# beside it — a receptionist needs it to book, a clinician expects it — but it
-# is never the thing on screen.
+# The TITLE is the thing shown, and it is the real professional term —
+# "Cardiologist", not "Heart specialist". It is what appears on a referral
+# letter, what a receptionist needs to book the appointment, and what the
+# patient will type into a search engine. A softened label reads more kindly
+# but sends someone to the wrong desk.
+#
+# Everything the patient reads AROUND it stays plain. The gloss says what the
+# title means in ordinary words, and the reason line names the test on their
+# own report, so "Cardiologist" never arrives unexplained.
 LAB_SPECIALTY_RULES: List[Tuple[Tuple[str, ...], str, str, str]] = [
     (("alt", "ast", "sgpt", "sgot", "bilirubin", "alkaline phosphatase", "ggt",
       "alp"),
-     "Liver specialist", "Hepatology / Gastroenterology", "checks your liver"),
+     "Hepatologist", "liver specialist", "checks your liver"),
     (("creatinine", "egfr", "gfr", "urea", "bun"),
-     "Kidney specialist", "Nephrology", "checks your kidneys"),
+     "Nephrologist", "kidney specialist", "checks your kidneys"),
     (("glucose", "hba1c", "a1c", "insulin"),
-     "Diabetes specialist", "Endocrinology", "checks your blood sugar"),
+     "Endocrinologist", "diabetes and hormone specialist", "checks your blood sugar"),
     (("tsh", "t3", "t4", "thyroid"),
-     "Thyroid specialist", "Endocrinology", "checks your thyroid"),
+     "Endocrinologist", "thyroid and hormone specialist", "checks your thyroid"),
     (("cholesterol", "ldl", "hdl", "triglyceride", "lipid"),
-     "Heart specialist", "Cardiology / lipid clinic", "checks the fats in your blood"),
+     "Cardiologist", "heart specialist", "checks the fats in your blood"),
     (("hemoglobin", "haemoglobin", "hematocrit", "haematocrit", "platelet",
       "wbc", "rbc", "mcv", "white blood cell", "red blood cell"),
-     "Blood specialist", "Haematology", "checks your blood count"),
+     "Haematologist", "blood specialist", "checks your blood count"),
     (("inr", "prothrombin", "aptt", "ptt"),
-     "Blood specialist", "Haematology", "checks how your blood clots"),
+     "Haematologist", "blood specialist", "checks how your blood clots"),
     (("uric acid", "urate"),
-     "Joint specialist", "Rheumatology", "is linked to joint problems like gout"),
+     "Rheumatologist", "joint specialist", "is linked to joint problems like gout"),
     (("psa",),
-     "Prostate specialist", "Urology", "checks your prostate"),
+     "Urologist", "prostate and urinary specialist", "checks your prostate"),
     (("troponin", "bnp", "nt-probnp"),
-     "Heart specialist", "Cardiology", "checks your heart"),
+     "Cardiologist", "heart specialist", "checks your heart"),
 ]
 
 # Triggers that represent a genuine safety finding — something is actually
@@ -359,22 +363,44 @@ def _warrants_specialty(item: Dict[str, Any]) -> bool:
     return item["confidence"] <= LOW_CONFIDENCE_THRESHOLD
 
 
-GENERAL_PRACTITIONER = "Your regular doctor"
-GENERAL_PRACTITIONER_CLINICAL = "General practitioner"
+# Bumped whenever this module changes the SHAPE or WORDING of what it returns.
+# The result is cached in the patient snapshot, and two API paths serve that
+# cache without recomputing — an all-duplicate upload and GET /consult-triage.
+# Without a version stamp those paths keep returning the output of whatever
+# code was current when the snapshot was written, indefinitely: after the
+# specialty titles changed, an existing user would still have been told to see
+# a "Heart specialist" no matter how many times they re-uploaded. Checking a
+# stored version against this one turns that silent staleness into a cheap
+# recompute.
+TRIAGE_OUTPUT_VERSION = "2026-08-18.specialist-titles"
+
+
+def _article(word: str) -> str:
+    """"a" or "an" for a specialist title.
+
+    Goes by the spoken sound, not the letter: it is "a urologist" (yur-) but
+    "an endocrinologist". A plain vowel test would produce "an urologist",
+    so U is deliberately excluded.
+    """
+    return "an" if (word or "")[:1].lower() in "aeio" else "a"
+
+
+GENERAL_PRACTITIONER = "General practitioner"
+GENERAL_PRACTITIONER_PLAIN = "your regular doctor"
 
 GP_FIRST_REASON = "They know your history and can refer you on if a specialist is needed."
 
 
 def _match_lab_specialty(test_name: str) -> Optional[Tuple[str, str, str]]:
-    """Returns (plain_name, clinical_name, reason_fragment) for a test name the
+    """Returns (specialty, plain_name, reason_fragment) for a test name the
     rule table covers, else None — in which case the LLM pass gets a chance."""
     name = (test_name or "").lower()
-    for keywords, plain, clinical, reason in LAB_SPECIALTY_RULES:
+    for keywords, specialty, plain, reason in LAB_SPECIALTY_RULES:
         for kw in keywords:
             # Word-boundary match so a short key like "alt" doesn't fire on
             # "Alkaline Phosphatase" or "Cobalt".
             if re.search(rf"\b{re.escape(kw)}\b", name):
-                return plain, clinical, reason
+                return specialty, plain, reason
     return None
 
 
@@ -696,19 +722,23 @@ specialty best suited to it.
 
 THE PATIENT READS THIS. Write for someone with no medical training who wants
 one short, clear line — not a paragraph.
-- `specialty` must be what you would SAY to them: "Kidney specialist", "Heart
-  specialist", "Skin specialist", "Your regular doctor". Never the textbook
-  term — not "Nephrology", not "Dermatology". If the right answer is just
-  their usual doctor, say "Your regular doctor".
-- `clinical_name` is the matching professional term ("Nephrology",
-  "Dermatology", "General practitioner"), used for booking. Give both.
+- `specialty` must be the professional TITLE of the doctor, in the singular:
+  "Nephrologist", "Cardiologist", "Dermatologist", "General practitioner".
+  This is what goes on a referral and what a receptionist needs to book, so
+  give the real term — not a softened one like "Kidney specialist". If the
+  right answer is their usual doctor, say "General practitioner".
+- `plain_name` is that title in ordinary words, lowercase: "kidney
+  specialist", "heart specialist", "your regular doctor". It is shown beside
+  the title so the title never arrives unexplained. Give both.
 - `reason` is ONE short sentence, maximum about 15 words, addressed to them
   as "you" / "your". "Your creatinine test checks your kidneys." Not two
   sentences, no hedging clauses, no restating the finding.
-- No abbreviations or clinical shorthand in `specialty` or `reason` — not
+- No abbreviations or clinical shorthand in `plain_name` or `reason` — not
   "INR", "CYP", "eGFR", "PRN", "monitoring", "medication review". If a term
   would send someone to a search engine, replace it with what it means:
   "your blood needs checking more often", not "you need INR monitoring".
+  `specialty` is the one field where the professional term is required; the
+  wording around it is what keeps the result readable.
 
 Rules:
 - Prefer their regular doctor unless the finding clearly belongs to one
@@ -741,11 +771,11 @@ SPECIALTY_JSON_SCHEMA = {
                 "properties": {
                     "id": {"type": "integer"},
                     "specialty": {"type": "string"},
-                    "clinical_name": {"type": "string"},
+                    "plain_name": {"type": "string"},
                     "reason": {"type": "string"},
                     "confidence": {"type": "number"},
                 },
-                "required": ["id", "specialty", "clinical_name", "reason", "confidence"],
+                "required": ["id", "specialty", "plain_name", "reason", "confidence"],
                 "additionalProperties": False,
             },
         },
@@ -810,7 +840,7 @@ def _suggest_specialties_llm(
             continue
         out[idx] = {
             "specialty": specialty,
-            "clinical_name": (assignment.get("clinical_name") or "").strip() or None,
+            "plain_name": (assignment.get("plain_name") or "").strip() or None,
             "reason": (assignment.get("reason") or "").strip(),
             "confidence": _clamp_confidence(assignment.get("confidence"), default=0.5),
         }
@@ -853,10 +883,10 @@ def _assign_specialties(
         if item.get("lab_test"):
             matched = _match_lab_specialty(item["lab_test"])
             if matched:
-                plain, clinical, reason = matched
+                specialty, plain, reason = matched
                 item["specialty"] = {
-                    "specialty": plain,
-                    "clinical_name": clinical,
+                    "specialty": specialty,
+                    "plain_name": plain,
                     # One line, in the second person, naming the test the
                     # patient can see on their own report.
                     "reason": f"Your {item['lab_test']} test {reason}.",
@@ -881,7 +911,7 @@ def _assign_specialties(
         else:
             item["specialty"] = {
                 "specialty": GENERAL_PRACTITIONER,
-                "clinical_name": GENERAL_PRACTITIONER_CLINICAL,
+                "plain_name": GENERAL_PRACTITIONER_PLAIN,
                 "reason": GP_FIRST_REASON,
                 "confidence": 0.7,
                 "basis": "default",
@@ -902,7 +932,7 @@ def _collect_specialties(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         name = specialty_block["specialty"]
         entry = by_specialty.setdefault(name, {
             "specialty": name,
-            "clinical_name": specialty_block.get("clinical_name"),
+            "plain_name": specialty_block.get("plain_name"),
             "reason": specialty_block["reason"],
             "confidence": specialty_block["confidence"],
             "basis": specialty_block["basis"],
@@ -1059,9 +1089,24 @@ def triage_consultation(
     if not items:
         headline = "Nothing to act on right now."
     elif consult_type == "doctor":
-        who = specialties[0]["specialty"].lower() if specialties else "a doctor"
-        if specialties and specialties[0]["specialty"] == GENERAL_PRACTITIONER:
-            who = "your regular doctor"
+        # The title carries the booking information, so it leads — but it
+        # leads inside a sentence a patient can read, with the plain gloss
+        # behind it. "See a cardiologist (heart specialist)" tells someone
+        # both where to go and what it means; "See cardiologist" tells them
+        # neither comfortably.
+        who = "a doctor"
+        if specialties:
+            title = specialties[0]["specialty"]
+            plain = (specialties[0].get("plain_name") or "").strip()
+            if title == GENERAL_PRACTITIONER:
+                # "General practitioner" adds nothing a patient needs here;
+                # everyone knows what their regular doctor is.
+                who = GENERAL_PRACTITIONER_PLAIN
+            else:
+                who = f"{_article(title)} {title.lower()}"
+                candidate = f"See {who} ({plain}) {URGENCY_WHEN[urgency]}."
+                if plain and plain.lower() != title.lower() and len(candidate) <= 70:
+                    who = f"{who} ({plain})"
         headline = f"See {who} {URGENCY_WHEN[urgency]}."
     else:
         headline = f"Speak to a pharmacist {URGENCY_WHEN[urgency]}."
@@ -1078,6 +1123,7 @@ def triage_consultation(
         )
 
     return {
+        "output_version": TRIAGE_OUTPUT_VERSION,
         "consult_needed": bool(items),
         "headline": headline,
         "consult_type": consult_type,
@@ -1173,18 +1219,19 @@ if __name__ == "__main__":
     assert labs["urgency"] == "soon"          # the ALT crossing, not the Creatinine drift
     by_specialty = {s["specialty"]: s for s in labs["recommended_specialties"]}
     # ALT actually crossed out of range — a real finding, so a specialty is named.
-    assert "Liver specialist" in by_specialty, by_specialty
-    liver = by_specialty["Liver specialist"]
+    assert "Hepatologist" in by_specialty, by_specialty
+    liver = by_specialty["Hepatologist"]
     assert liver["basis"] == "rule"
-    # Plain name on screen, clinical term kept alongside for booking.
-    assert liver["clinical_name"] == "Hepatology / Gastroenterology"
+    # The professional title is what gets shown and booked; the plain gloss
+    # rides alongside so the title never arrives unexplained.
+    assert liver["plain_name"] == "liver specialist"
     # One short line, addressed to the patient.
     assert liver["reason"] == "Your ALT test checks your liver.", liver["reason"]
     assert len(liver["reason"].split()) <= 12
     # Creatinine is still INSIDE its range, merely drifting toward the edge. It
     # stays on the referral list, but naming a nephrologist for a normal result
     # overstates it — see _warrants_specialty().
-    assert "Kidney specialist" not in by_specialty, by_specialty
+    assert "Nephrologist" not in by_specialty, by_specialty
     drift_item = next(i for i in labs["referral_items"]
                       if i["trigger"] == "lab_approaching_threshold")
     assert drift_item["specialty"] is None
@@ -1196,7 +1243,13 @@ if __name__ == "__main__":
 
     # Word-boundary guard: "ALP"/"ALT" keys must not fire on unrelated names.
     assert _match_lab_specialty("Cobalt") is None
-    assert _match_lab_specialty("Alkaline Phosphatase")[0] == "Liver specialist"
+    assert _match_lab_specialty("Alkaline Phosphatase")[0] == "Hepatologist"
+    # Word-boundary matching still holds with the new titles.
+    assert _match_lab_specialty("Creatinine")[0] == "Nephrologist"
+    assert _match_lab_specialty("Troponin I")[0] == "Cardiologist"
+    # Title is the professional term; the gloss beside it stays plain.
+    assert _match_lab_specialty("HbA1c")[:2] == (
+        "Endocrinologist", "diabetes and hormone specialist")
 
     # --- Case 4: low confidence lowers the score but NEVER the urgency -----
     low_conf = triage_consultation(
@@ -1377,7 +1430,7 @@ if __name__ == "__main__":
         use_llm=False,
     )
     assert [s["specialty"] for s in crossed["recommended_specialties"]] == [
-        "Heart specialist"], crossed["recommended_specialties"]
+        "Cardiologist"], crossed["recommended_specialties"]
 
     # --- Every patient-facing string stays short and jargon-free -----------
     for result in (crossed, labs, allergy, pharmacist_only):
@@ -1390,7 +1443,10 @@ if __name__ == "__main__":
                            "General practitioner (family"):
                 assert jargon not in spec["specialty"], spec["specialty"]
 
-    assert crossed["headline"] == "See heart specialist in the next few days.", crossed["headline"]
+    assert crossed["headline"] == (
+        "See a cardiologist (heart specialist) in the next few days."
+    ), crossed["headline"]
+    assert _article("Endocrinologist") == "an" and _article("Urologist") == "a"
     assert pharmacist_only["headline"] == "Speak to a pharmacist in the next few days."
     assert allergy["headline"] == "See your regular doctor today or tomorrow.", allergy["headline"]
     assert clean["headline"] == "Nothing to act on right now."

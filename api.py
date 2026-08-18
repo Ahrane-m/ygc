@@ -53,7 +53,7 @@ import db
 import graph_db
 import storage
 from auth import get_current_user
-from consult_triage import triage_consultation
+from consult_triage import TRIAGE_OUTPUT_VERSION, triage_consultation
 from document_filter import NonMedicalDocumentError, assert_medical_document
 from evidence_grading import graph_backed_findings_from_antidotes
 from identity_guard import partition_identity_mismatch
@@ -346,7 +346,7 @@ async def upload_documents(
                     "timeline": snapshot.get("patient_timeline", {}),
                     "cross_check_report": snapshot.get("cross_check_report", {}),
                     "lab_trends": snapshot.get("lab_trends", {}),
-                    "consult_triage": snapshot.get("consult_triage", {}),
+                    "consult_triage": _fresh_triage(snapshot),
                     "duplicate_files_skipped": duplicate_files_skipped,
                     "antidote_reference_notes": [],
                     "indexed": True,
@@ -424,8 +424,17 @@ async def upload_documents(
     # evidence-backed and cite its source, instead of being capped as
     # unverifiable model recall. Fail-open as always: no graph just means every
     # finding grades as model_knowledge, which is the honest default.
+    # Both the printed name and the extracted ingredients are offered. The
+    # printed name is what the prescription said ("Naloxone Hydrochloride
+    # 400mcg"); `ingredients` is the cleaner form the extractor already
+    # separated out, and classify_medication() prefers it for exactly this
+    # reason. Sending only the printed name meant a combination product, or
+    # anything printed with its salt, never reached the reference data.
     med_names = sorted({
-        m.get("name") for m in timeline.get("medications_timeline", []) if m.get("name")
+        value
+        for m in timeline.get("medications_timeline", [])
+        for value in [m.get("name"), *(m.get("ingredients") or [])]
+        if value
     })
     antidote_references: Dict[str, Dict[str, Any]] = {}
     try:
@@ -733,6 +742,31 @@ async def get_risk_timeline(user_id: str = Depends(get_current_user)) -> Dict[st
     }
 
 
+def _fresh_triage(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """The snapshot's cached triage if it was produced by the CURRENT version
+    of consult_triage, otherwise a fresh one.
+
+    Checking only that the key EXISTS — which both read paths used to do —
+    pins a user to whatever wording was current when their snapshot was
+    written. Recomputing is cheap here: the findings are already stored, and
+    triage over stored findings is rule-based, so no model call is made.
+    """
+    cached = snapshot.get("consult_triage")
+    if isinstance(cached, dict) and cached.get("output_version") == TRIAGE_OUTPUT_VERSION:
+        return cached
+    if cached:
+        logger.info(
+            "consult triage: cached output_version=%r is stale (current %r) — recomputing",
+            cached.get("output_version"), TRIAGE_OUTPUT_VERSION,
+        )
+    return triage_consultation(
+        snapshot.get("cross_check_report") or {},
+        snapshot.get("lab_trends") or {},
+        snapshot.get("patient_timeline") or {},
+        use_llm=False,
+    )
+
+
 @app.get("/api/v1/consult-triage")
 async def get_consult_triage(user_id: str = Depends(get_current_user)) -> Dict[str, Any]:
     """Returns who the authenticated user should consult about what was found
@@ -748,13 +782,7 @@ async def get_consult_triage(user_id: str = Depends(get_current_user)) -> Dict[s
     snapshot = db.load_patient_snapshot(user_id)
     if snapshot is None:
         raise HTTPException(404, "No records found for this user.")
-    if "consult_triage" in snapshot:
-        return snapshot["consult_triage"]
-    return triage_consultation(
-        snapshot.get("cross_check_report") or {},
-        snapshot.get("lab_trends") or {},
-        snapshot.get("patient_timeline") or {},
-    )
+    return _fresh_triage(snapshot)
 
 
 # ---------------------------------------------------------------------------

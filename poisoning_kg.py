@@ -309,21 +309,35 @@ def lookup_antidote_references(drug_names: List[str]) -> Dict[str, Dict[str, Any
 
     logger.info("lookup: checking %d drug name(s) against the antidote graph", len(names))
 
+    # A prescription prints "Naloxone Hydrochloride 400mcg"; the graph keys on
+    # "naloxone". Matching only the printed form misses, and the miss looks
+    # exactly like the drug genuinely not being in the reference data — so the
+    # citation is lost silently and the finding drops to unverified model
+    # recall. Every variant is offered and the original spelling is carried
+    # through as the result key.
+    from document_dedup import name_variants
+
+    pairs = [
+        {"wanted": name, "candidate": variant, "exact": variant == name.strip().lower()}
+        for name in names for variant in name_variants(name)
+    ]
+
     with session_scope("lookup_antidote_references") as session:
         records = run_read(
             session,
             "lookup_antidote_references",
             f"match {len(names)} medicine name(s)",
             """
-            UNWIND $names AS wanted
-            MATCH (m:Medicine {name: toLower(wanted)})-[l:LISTED_IN]->(s:SourceDocument)
-            RETURN wanted AS wanted, m.display_name AS display_name,
+            UNWIND $pairs AS pair
+            MATCH (m:Medicine {name: pair.candidate})-[l:LISTED_IN]->(s:SourceDocument)
+            RETURN pair.wanted AS wanted, pair.exact AS exact_match,
+                   m.display_name AS display_name,
                    l.category AS category, l.dosage_form AS dosage_form,
                    l.list_type AS list_type, s.filename AS source_document,
                    s.population AS population
             ORDER BY wanted, s.population
             """,
-            names=names,
+            pairs=pairs,
         )
 
     found: Dict[str, Dict[str, Any]] = {}
@@ -331,6 +345,7 @@ def lookup_antidote_references(drug_names: List[str]) -> Dict[str, Dict[str, Any
         entry = found.setdefault(r["wanted"], {
             "display_name": r["display_name"],
             "category": r["category"],
+            "matched_exactly": r["exact_match"],
             "listings": [],
         })
         entry["listings"].append(
@@ -338,10 +353,20 @@ def lookup_antidote_references(drug_names: List[str]) -> Dict[str, Dict[str, Any
         )
 
     if found:
+        # Exact and normalized hits are logged apart. A normalized hit means
+        # the printed name did NOT match and only did so after salts and doses
+        # were stripped — worth seeing, because it is the case that used to
+        # fail silently.
+        normalized = sorted(k for k, v in found.items() if not v["matched_exactly"])
         logger.info(
             "lookup: %d of %d drug name(s) are listed as antidotes: %s",
             len(found), len(names), ", ".join(sorted(found)),
         )
+        if normalized:
+            logger.info(
+                "lookup: %d matched only after normalizing the printed name: %s",
+                len(normalized), ", ".join(normalized),
+            )
         # Each hit spelled out, at DEBUG. A drug listed in both the adult EML
         # and the children's EMLc returns two listings, and this is where you
         # confirm both came back rather than whichever was ingested last.

@@ -339,6 +339,13 @@ def ensure_constraints() -> None:
         "AgeRestriction.id unique": (
             "CREATE CONSTRAINT IF NOT EXISTS FOR (r:AgeRestriction) REQUIRE r.id IS UNIQUE"
         ),
+        # FDA enzyme-role reference (interactions_kg.py).
+        "Enzyme.name unique": (
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (e:Enzyme) REQUIRE e.name IS UNIQUE"
+        ),
+        "PotencyDefinition.id unique": (
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (d:PotencyDefinition) REQUIRE d.id IS UNIQUE"
+        ),
     }
     with session_scope("ensure_constraints") as session:
         for step, cypher in constraints.items():

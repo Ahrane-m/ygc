@@ -169,7 +169,9 @@ def lookup_guidance_for_drugs(drug_names: Sequence[str]) -> List[Dict[str, Any]]
     one of those is present too. Same rule the local matcher applies, so the
     two cannot drift into disagreeing about when guidance fires.
     """
-    names = [n for n in drug_names if n]
+    from document_dedup import name_variants
+
+    names = sorted({v for n in drug_names for v in name_variants(n)})
     if not names:
         return []
 

@@ -452,7 +452,9 @@ def medicines_in_section(section_title_fragment: str) -> List[Dict[str, Any]]:
 
 def lookup_age_restrictions(drug_names: List[str]) -> List[Dict[str, Any]]:
     """Age/weight restrictions WHO records for any of these drugs."""
-    names = [n for n in drug_names if n]
+    from document_dedup import name_variants
+
+    names = sorted({v for n in drug_names for v in name_variants(n)})
     if not names:
         return []
     with session_scope("lookup_age_restrictions") as session:
