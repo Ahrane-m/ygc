@@ -123,6 +123,37 @@ DISCLAIMER = (
 # conflict is the more dangerous error.
 LOW_CONFIDENCE_THRESHOLD = 0.6
 
+# Triggers that describe how well a DOCUMENT WAS READ, not what was found in
+# the patient's record. They are still reported — see `document_quality_notices`
+# in the result — but they never set consult_needed, consult_type or urgency.
+#
+# The distinction matters because the two answer different questions. "Two of
+# your medicines interact" is a fact about the patient and is a reason to speak
+# to someone. "One field on your scan was hard to read" is a fact about the
+# paperwork, and telling someone to go and see a pharmacist over it trains them
+# to ignore the times it says something real.
+DATA_QUALITY_TRIGGERS = {"low_extraction_confidence", "translation_uncertain"}
+
+# Above this, the document was read well enough that a note about one field is
+# a transcription caveat rather than a reason to distrust the medication list.
+#
+# This threshold exists because `illegible_or_low_confidence_fields` is not
+# purely a list of unreadable fields: the extractor also uses it to record
+# interpretation choices it made on text it read perfectly well ("this
+# combination product was recorded as its mass component"). On a document that
+# scored 0.85 overall, such an entry is the extractor being transparent, not
+# the extractor struggling — so it must not by itself produce a referral.
+TRUSTED_EXTRACTION_THRESHOLD = 0.8
+
+# Which unreadable fields are worth raising at all. An unreadable clinic
+# footer, letterhead or signature line changes nothing about what the patient
+# is taking; an unreadable dose changes everything.
+MATERIAL_FIELD_PATTERN = re.compile(
+    r"\b(medication|medicine|drug|ingredient|dosage|dose|strength|frequency|"
+    r"lab.?result|test.?name|reference.?range|value|unit|allerg)",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # 1. Routing rules — cross-check findings
@@ -247,6 +278,17 @@ ROUTING_RULES: Dict[Tuple[str, Optional[str]], Dict[str, str]] = {
             "to the edge of it. Nothing is outside the normal range yet — this is worth "
             "mentioning at the next scheduled appointment so it is on the record and can "
             "be kept an eye on."
+        ),
+    },
+    ("lab_single_abnormal", None): {
+        "route": "doctor",
+        "urgency": "routine",
+        "why_this_route": (
+            "This test appears only once in the records on file, and that one result is "
+            "outside the normal range. With nothing earlier to compare it against there "
+            "is no way to tell from these documents whether it has changed or has always "
+            "been at this level, which is exactly the question a doctor can settle — "
+            "usually by repeating the test."
         ),
     },
     ("low_extraction_confidence", None): {
@@ -436,6 +478,10 @@ def _make_item(
         "urgency": rule["urgency"],
         "why_this_route": rule["why_this_route"],
         "confidence": confidence,
+        # "clinical" == a finding about the patient, and therefore a reason to
+        # consult someone. "data_quality" == a finding about the document it
+        # came from, reported separately and never counted as a referral.
+        "category": "data_quality" if trigger in DATA_QUALITY_TRIGGERS else "clinical",
     }
     if severity:
         item["severity"] = severity
@@ -644,15 +690,49 @@ def _items_from_lab_trends(lab_trends: Dict[str, Any]) -> List[Dict[str, Any]]:
                 lab_test=test_name,
             ))
 
+    # Tests with a single reading and no history to trend against. Routed
+    # more cautiously than a crossing: one out-of-range value with nothing
+    # before it could be a real change or could be this patient's normal, and
+    # nothing in the record distinguishes those. A normal or un-assessable
+    # single result produces nothing, same as a stable in-range trend does.
+    for single in lab_trends.get("single_results") or []:
+        if single.get("status") not in ("high", "low"):
+            continue
+        items.append(_make_item(
+            "lab_single_abnormal",
+            subject=single.get("test_name") or "unnamed test",
+            detail=single.get("explanation") or "",
+            confidence=_clamp_confidence(single.get("confidence")),
+            lab_test=single.get("test_name"),
+        ))
+
     return items
+
+
+def _has_material_illegible_field(entries: List[Any]) -> bool:
+    """True when at least one unreadable field could change what the patient
+    is understood to be taking.
+
+    Everything in `illegible_or_low_confidence_fields` is free text written by
+    the extractor, so this matches on keywords rather than parsing paths. It
+    errs toward matching: the cost of one extra note is a line of text, while
+    the cost of missing an unreadable dose is a wrong medication list."""
+    return any(
+        MATERIAL_FIELD_PATTERN.search(str(entry))
+        for entry in entries
+        if entry
+    )
 
 
 def _items_from_extraction_quality(timeline: Dict[str, Any]) -> List[Dict[str, Any]]:
     """One item per document whose extraction was poor enough that the
-    medication list built from it may not be trustworthy. This is a
-    data-quality referral, not a clinical one, and is labelled as such.
+    medication list built from it may not be trustworthy.
 
-    Two distinct problems are routed separately, because they have different
+    These are DOCUMENT findings, not patient findings, so they are marked
+    `category: "data_quality"` and reported separately from the referral —
+    with one deliberate exception, noted inline below.
+
+    Two distinct problems are handled separately, because they have different
     fixes: a document that could not be READ (rescan it) versus one whose
     English drug names were CONVERTED from another language (have a pharmacist
     confirm them). Collapsing them would tell the user to do the wrong thing
@@ -667,7 +747,7 @@ def _items_from_extraction_quality(timeline: Dict[str, Any]) -> List[Dict[str, A
         risk = assess_translation_risk(visit)
         if risk["flag"] in ("high", "review") and not risk["is_english_only"]:
             translation_confidence = risk["translation_confidence"]
-            items.append(_make_item(
+            translation_item = _make_item(
                 "translation_uncertain",
                 subject=source,
                 detail=risk["message"] or "",
@@ -677,13 +757,37 @@ def _items_from_extraction_quality(timeline: Dict[str, Any]) -> List[Dict[str, A
                     else translation_confidence,
                     default=0.7,
                 ),
-            ))
+            )
+            if risk["flag"] == "high":
+                # The one document-quality problem that IS a referral. A "high"
+                # flag means the drug names in the record may not be the drugs
+                # on the page — and unlike a blurry scan, that failure is
+                # invisible: the record reads as complete and correct. Only
+                # someone holding both the original document and the dispensing
+                # record can settle it, which is a pharmacist. A "review" flag
+                # (nothing individually low, the two axes merely compound)
+                # stays a note about the document.
+                translation_item["category"] = "clinical"
+            items.append(translation_item)
 
         overall = visit.get("overall_confidence")
         illegible = visit.get("illegible_or_low_confidence_fields") or []
 
         low_overall = isinstance(overall, (int, float)) and overall <= LOW_CONFIDENCE_THRESHOLD
-        if not low_overall and not illegible:
+
+        # A note about an unreadable field only counts on its own if the field
+        # was one that matters AND the document did not otherwise read well.
+        # Without the second half, a clean 0.85-confidence extraction that
+        # transparently recorded one interpretation choice produced the same
+        # output as a barely legible scan.
+        trusted = (
+            isinstance(overall, (int, float)) and overall >= TRUSTED_EXTRACTION_THRESHOLD
+        )
+        material_illegible = (
+            bool(illegible) and not trusted and _has_material_illegible_field(illegible)
+        )
+
+        if not low_overall and not material_illegible:
             continue
 
         reasons = []
@@ -960,12 +1064,19 @@ def _summarize(
     consult_type: Optional[str],
     urgency: Optional[str],
     specialties: List[Dict[str, Any]],
+    quality_items: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Plain-language summary, filled from the fields computed above the same
     way lab_trends._explain() does — so it cannot say anything the routing
-    does not already support."""
+    does not already support.
+
+    `items` is the CLINICAL findings only. Document-quality notices are passed
+    separately and described as what they are, so the summary never presents a
+    hard-to-read scan as a reason to consult someone."""
+    quality_items = quality_items or []
+
     if not items:
-        return (
+        summary = (
             "No automated trigger for a consultation was found: the safety cross-check "
             "reported no interactions, duplicates, dosage conflicts or allergy conflicts, "
             "and no lab test on file has drifted out of its reference range. This is NOT "
@@ -973,6 +1084,15 @@ def _summarize(
             "in the documents provided. Anyone with symptoms, questions, or a scheduled "
             "review should still see their doctor or pharmacist as normal."
         )
+        if quality_items:
+            summary += (
+                f" Separately, {len(quality_items)} uploaded document(s) could not be read "
+                "with full confidence, so anything taken from them is worth checking "
+                "against the original paperwork. That is a note about the scan, not a "
+                "finding about the patient, and on its own it is not a reason to book "
+                "anything."
+            )
+        return summary
 
     pharmacist_items = [i for i in items if i["route"] == "pharmacist"]
     doctor_items = [i for i in items if i["route"] == "doctor"]
@@ -996,10 +1116,11 @@ def _summarize(
     else:
         lead = (
             f"A pharmacist should be consulted — {timing}. "
-            f"{len(pharmacist_items)} finding(s) relate to how the medications on file "
-            "fit together, which a pharmacist can resolve directly, without an "
-            "appointment. Nothing found here requires a prescribing or diagnostic "
-            "decision, so a doctor's appointment is not indicated by these checks alone."
+            f"{len(pharmacist_items)} finding(s) concern the medicines on file — how they "
+            "combine, overlap, or were recorded — which a pharmacist can resolve directly, "
+            "without an appointment. Nothing found here requires a prescribing or "
+            "diagnostic decision, so a doctor's appointment is not indicated by these "
+            "checks alone."
         )
 
     low_confidence = [i for i in items if i["confidence"] <= LOW_CONFIDENCE_THRESHOLD]
@@ -1008,6 +1129,12 @@ def _summarize(
             f" Note that {len(low_confidence)} of these finding(s) came from documents "
             "that were hard to read — bring the original documents along so they can be "
             "checked directly."
+        )
+    if quality_items:
+        lead += (
+            f" Separately, {len(quality_items)} document(s) could not be read with full "
+            "confidence — worth confirming against the original paperwork while you are "
+            "there, though not a reason to consult anyone on its own."
         )
     return lead
 
@@ -1050,20 +1177,37 @@ def triage_consultation(
         "pharmacist_actions": [item, ...],  # resolvable without an appointment
         "doctor_actions": [item, ...],      # need a prescribing/diagnostic decision
         "referral_items": [item, ...],      # all of the above, most urgent first
+        "document_quality_notices": [item, ...],  # about the SCANS, not the patient
+        "document_quality_note": str | None,      # one line covering the above
         "summary": str,
         "emergency_advice": str,
         "note": str,
       }
+
+    Note that `consult_needed` is decided by CLINICAL findings alone. A
+    document that scanned badly is reported in `document_quality_notices` and
+    never sets `consult_needed`, `consult_type` or `urgency` — see
+    DATA_QUALITY_TRIGGERS for why.
     """
-    items = _items_from_cross_check(cross_check or {})
-    items += _items_from_lab_trends(lab_trends or {})
-    items += _items_from_extraction_quality(timeline or {})
+    all_items = _items_from_cross_check(cross_check or {})
+    all_items += _items_from_lab_trends(lab_trends or {})
+    all_items += _items_from_extraction_quality(timeline or {})
+
+    # The split that keeps "your scan was blurry" out of "you need to see
+    # someone". Everything below this line, up to the returned dict, reasons
+    # about `items` — the clinical findings — only.
+    items = [i for i in all_items if i.get("category") != "data_quality"]
+    quality_items = [i for i in all_items if i.get("category") == "data_quality"]
 
     _assign_specialties(items, model=model, use_llm=use_llm)
 
     # Most urgent first, then most confident, so the first line a reader sees
     # is the one that matters most.
-    items.sort(key=lambda i: (-URGENCY_ORDER[i["urgency"]], -i["confidence"]))
+    def sort_key(item: Dict[str, Any]) -> Tuple[int, float]:
+        return (-URGENCY_ORDER[item["urgency"]], -item["confidence"])
+
+    items.sort(key=sort_key)
+    quality_items.sort(key=sort_key)
 
     doctor_items = [i for i in items if i["route"] == "doctor"]
     pharmacist_items = [i for i in items if i["route"] == "pharmacist"]
@@ -1086,7 +1230,11 @@ def triage_consultation(
 
     # One line, plain, imperative — what to do and by when. Everything else in
     # this result is detail behind it.
-    if not items:
+    if not items and quality_items:
+        # Distinct from the fully clean headline below, because there IS
+        # something to do — just not with a clinician.
+        headline = "Nothing to act on — a document needs re-checking."
+    elif not items:
         headline = "Nothing to act on right now."
     elif consult_type == "doctor":
         # The title carries the booking information, so it leads — but it
@@ -1122,6 +1270,18 @@ def triage_consultation(
             "place to raise it."
         )
 
+    # One line for the document-quality stream, phrased so it cannot be read
+    # as a clinical instruction. Kept out of `summary` when there is nothing
+    # clinical to say, so a caller can render it in its own, quieter place.
+    document_quality_note = None
+    if quality_items:
+        document_quality_note = (
+            f"{len(quality_items)} uploaded document(s) could not be read with full "
+            "confidence, so the medicines and results taken from them are worth "
+            "checking against the original paperwork. This describes the document, "
+            "not the patient — on its own it is not a reason to see anyone."
+        )
+
     return {
         "output_version": TRIAGE_OUTPUT_VERSION,
         "consult_needed": bool(items),
@@ -1135,7 +1295,9 @@ def triage_consultation(
         "pharmacist_actions": pharmacist_items,
         "doctor_actions": doctor_items,
         "referral_items": items,
-        "summary": _summarize(items, consult_type, urgency, specialties),
+        "document_quality_notices": quality_items,
+        "document_quality_note": document_quality_note,
+        "summary": _summarize(items, consult_type, urgency, specialties, quality_items),
         "emergency_advice": EMERGENCY_ADVICE,
         "note": DISCLAIMER,
     }
@@ -1289,7 +1451,9 @@ if __name__ == "__main__":
     assert "NOT a clean bill of health" in clean["summary"]
     assert clean["emergency_advice"]
 
-    # --- Case 7: unreadable documents produce a data-quality referral ------
+    # --- Case 7: unreadable documents are a DOCUMENT notice, not a referral -
+    # They are reported in full, but they must not tell the patient to go and
+    # see someone: nothing was found about the patient, only about the scan.
     poor_scan = triage_consultation(
         cross_check={},
         timeline={"visits": [
@@ -1300,9 +1464,72 @@ if __name__ == "__main__":
         ]},
         use_llm=False,
     )
-    assert len(poor_scan["referral_items"]) == 1
-    assert poor_scan["referral_items"][0]["subject"] == "scan1.jpg"
-    assert poor_scan["consult_type"] == "pharmacist"
+    assert poor_scan["referral_items"] == [], poor_scan["referral_items"]
+    assert poor_scan["pharmacist_actions"] == []
+    assert poor_scan["consult_needed"] is False
+    assert poor_scan["consult_type"] is None
+    assert poor_scan["urgency"] is None
+    assert len(poor_scan["document_quality_notices"]) == 1
+    notice = poor_scan["document_quality_notices"][0]
+    assert notice["subject"] == "scan1.jpg"
+    assert notice["trigger"] == "low_extraction_confidence"
+    assert notice["category"] == "data_quality"
+    assert poor_scan["document_quality_note"]
+    assert poor_scan["headline"] == "Nothing to act on — a document needs re-checking."
+    # Still not a clean bill of health, and the note explains itself.
+    assert "NOT a clean bill of health" in poor_scan["summary"]
+    assert "not a finding about the patient" in poor_scan["summary"]
+
+    # --- Case 7a: a well-read document must produce nothing at all ----------
+    # This is the regression that motivated the split. The extractor records
+    # interpretation choices in the same field it records unreadable ones, so
+    # a confident extraction can still arrive with a non-empty list. That is
+    # transparency, not a problem, and it used to produce "Speak to a
+    # pharmacist" on a document with no clinical findings whatsoever.
+    well_read = triage_consultation(
+        cross_check={},
+        timeline={"visits": [
+            {"_source": {"file": "clear_prescription.png"}, "overall_confidence": 0.85,
+             "illegible_or_low_confidence_fields": [
+                 "dosage_value/dosage_unit for 'Calcium carbonate + Vitamin D3' reduced "
+                 "to 500 mg (document shows '500 mg / 250 IU' combination)",
+                 "quantity fields were read from printed table but not repeated "
+                 "individually in this extraction (visible on document)",
+             ]},
+        ]},
+        use_llm=False,
+    )
+    assert well_read["consult_needed"] is False, well_read["referral_items"]
+    assert well_read["consult_type"] is None
+    assert well_read["referral_items"] == []
+    assert well_read["document_quality_notices"] == []
+    assert well_read["headline"] == "Nothing to act on right now."
+
+    # A material field that genuinely could not be read on a middling document
+    # still surfaces — the trust threshold must not swallow real problems.
+    borderline = triage_consultation(
+        cross_check={},
+        timeline={"visits": [
+            {"_source": {"file": "smudged.jpg"}, "overall_confidence": 0.7,
+             "illegible_or_low_confidence_fields": ["dosage for Metformin was smudged"]},
+        ]},
+        use_llm=False,
+    )
+    assert len(borderline["document_quality_notices"]) == 1, borderline
+    assert borderline["consult_needed"] is False
+
+    # An unreadable field that changes nothing about the medication list is
+    # not worth reporting at all.
+    immaterial = triage_consultation(
+        cross_check={},
+        timeline={"visits": [
+            {"_source": {"file": "cropped.jpg"}, "overall_confidence": 0.7,
+             "illegible_or_low_confidence_fields": ["clinic footer", "signature line"]},
+        ]},
+        use_llm=False,
+    )
+    assert immaterial["document_quality_notices"] == [], immaterial
+    assert immaterial["consult_needed"] is False
 
     # --- Case 7b: a translated document is flagged separately from an
     #     unreadable one — they have different fixes ------------------------
@@ -1321,13 +1548,36 @@ if __name__ == "__main__":
         ]},
         use_llm=False,
     )
+    # A "high" translation flag IS a referral: unlike a blurry scan, a
+    # mistranslated drug name leaves a record that looks perfectly correct.
     assert len(translated["referral_items"]) == 1, translated["referral_items"]
     item = translated["referral_items"][0]
     assert item["trigger"] == "translation_uncertain", item
+    assert item["category"] == "clinical", item
     assert item["subject"] == "japanese_rx.pdf"
     assert item["route"] == "pharmacist" and item["urgency"] == "soon"
+    assert translated["consult_needed"] is True
+    assert translated["consult_type"] == "pharmacist"
     # ocr 0.9 * translation 0.5 -> the combined figure, not either alone.
     assert item["confidence"] == 0.45, item["confidence"]
+
+    # A "review" flag — neither axis individually low, the two merely compound
+    # — stays a document note rather than sending anyone to a pharmacist.
+    mild_translation = triage_consultation(
+        cross_check={},
+        timeline={"visits": [
+            {"_source": {"file": "spanish_rx.pdf"},
+             "document_language": "Spanish", "additional_languages": [],
+             "ocr_confidence": 0.8, "translation_confidence": 0.8,
+             "overall_confidence": 0.85, "illegible_or_low_confidence_fields": []},
+        ]},
+        use_llm=False,
+    )
+    mild_triggers = {i["trigger"] for i in mild_translation["document_quality_notices"]}
+    assert mild_triggers == {"translation_uncertain"}, mild_translation
+    assert mild_translation["consult_needed"] is False, mild_translation
+    assert mild_translation["referral_items"] == []
+    assert mild_translation["document_quality_notices"][0]["category"] == "data_quality"
 
     # A blurry ENGLISH document must be routed as unreadable, never as a
     # translation problem — telling someone to confirm a translation that
@@ -1342,8 +1592,9 @@ if __name__ == "__main__":
         ]},
         use_llm=False,
     )
-    triggers = {i["trigger"] for i in blurry_english["referral_items"]}
-    assert triggers == {"low_extraction_confidence"}, triggers
+    triggers = {i["trigger"] for i in blurry_english["document_quality_notices"]}
+    assert triggers == {"low_extraction_confidence"}, blurry_english
+    assert blurry_english["referral_items"] == [], blurry_english["referral_items"]
 
     # --- Case 7c: timing separates live risks from historical pairings -----
     timed = triage_consultation(

@@ -504,10 +504,23 @@ async def upload_documents(
         evidence.get("reference_graph", 0), evidence.get("model_knowledge", 0),
     )
 
+    # Demographics for the single-reading assessments are read off the
+    # timeline inside track_lab_trends() rather than passed in, so the
+    # /api/v1/lab-trends recompute path gets them on the same terms.
     lab_trends = track_lab_trends(timeline)
+    patient_context = lab_trends.get("patient_context") or {}
+    single_results = lab_trends.get("single_results") or []
     logger.info(
-        "upload_documents: user=%s lab trend tracking found %d trend(s), %d test(s) with insufficient data",
-        user_id, len(lab_trends["trends"]), len(lab_trends["insufficient_data"]),
+        "upload_documents: user=%s lab trend tracking found %d trend(s), %d single "
+        "reading(s) assessed (%d against the report's own range, %d against a general "
+        "range, %d with no range available), %d test(s) with insufficient data; "
+        "demographics %s",
+        user_id, len(lab_trends["trends"]), len(single_results),
+        sum(1 for s in single_results if s.get("range_source") == "report"),
+        sum(1 for s in single_results if s.get("range_source") == "general"),
+        sum(1 for s in single_results if s.get("range_source") is None),
+        len(lab_trends["insufficient_data"]),
+        patient_context.get("source", "unknown"),
     )
 
     # Route whatever the cross-check and trend tracking found to the
@@ -515,9 +528,14 @@ async def upload_documents(
     # so it adds no clinical judgment of its own.
     consult_triage = triage_consultation(cross_check, lab_trends, timeline)
     logger.info(
-        "upload_documents: user=%s consult triage: needed=%s type=%s urgency=%s confidence=%s",
+        "upload_documents: user=%s consult triage: needed=%s type=%s urgency=%s "
+        "confidence=%s clinical_findings=%d document_quality_notices=%d",
         user_id, consult_triage["consult_needed"], consult_triage["consult_type"],
         consult_triage["urgency"], consult_triage["confidence"],
+        len(consult_triage["referral_items"]),
+        # Logged separately from the referral because they no longer drive it:
+        # a document that scanned badly is not a reason to consult anyone.
+        len(consult_triage["document_quality_notices"]),
     )
 
     # Red flag for documents whose English fields were converted from another
