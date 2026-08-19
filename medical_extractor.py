@@ -580,6 +580,37 @@ DEMO_PLACEHOLDER_MARKERS = frozenset({
 })
 
 
+# Latin markers are matched on WORD BOUNDARIES, not as substrings. Plain
+# `"DEMO" in name` rejected real people: Demonte, Demopoulos and Demond are
+# surnames, and "Sample Collected" / "Sample ID" is standard lab-report
+# wording that lands in the patient-name field when extraction slips. Those
+# users were silently unable to upload — the page is dropped with only a log
+# line, so nothing ever told them why.
+#
+# Non-Latin markers keep substring matching on purpose: Japanese and Chinese
+# do not space their words, so \b would never fire between "デモ" and the
+# character after it. Those markers are long, distinctive sequences with no
+# realistic false-positive surface, which is exactly what makes the looser
+# test safe there and unsafe for a four-letter ASCII word.
+_LATIN_MARKER_RE = re.compile(
+    r"\b(" + "|".join(
+        re.escape(m) for m in DEMO_PLACEHOLDER_MARKERS if m.isascii()
+    ) + r")\b",
+    re.IGNORECASE,
+)
+_NON_LATIN_MARKERS = frozenset(m for m in DEMO_PLACEHOLDER_MARKERS if not m.isascii())
+
+
+def _matches_demo_marker(value: Any) -> bool:
+    """True if a printed name is a demo/placeholder marker."""
+    text = (value or "") if isinstance(value, str) else ""
+    if not text:
+        return False
+    if _LATIN_MARKER_RE.search(text):
+        return True
+    return any(marker in text for marker in _NON_LATIN_MARKERS)
+
+
 def _is_demo_document(d: Dict[str, Any]) -> bool:
     """Detect placeholder/template documents (e.g. sample datasets that
     include a 'DEMO PATIENT' / 'DEMO MEDICINE' mock page) so they don't get
@@ -587,12 +618,10 @@ def _is_demo_document(d: Dict[str, Any]) -> bool:
     best-effort set of transliterated equivalents (see
     DEMO_PLACEHOLDER_MARKERS) since patient/medication names are printed in
     the document's original language, not translated during extraction."""
-    name = (d.get("patient_name") or "").upper()
-    if any(marker in name for marker in DEMO_PLACEHOLDER_MARKERS):
+    if _matches_demo_marker(d.get("patient_name")):
         return True
-    for med in d.get("medications", []):
-        med_name = (med.get("name") or "").upper()
-        if any(marker in med_name for marker in DEMO_PLACEHOLDER_MARKERS):
+    for med in d.get("medications", []) or []:
+        if _matches_demo_marker(med.get("name")):
             return True
     return False
 

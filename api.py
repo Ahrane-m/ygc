@@ -59,6 +59,7 @@ from evidence_grading import graph_backed_findings_from_antidotes
 from identity_guard import partition_identity_mismatch
 from language_guard import (
     UnsupportedLanguageError,
+    apply_language_degradation,
     assert_supported_language,
     assess_documents_translation_risk,
 )
@@ -194,6 +195,9 @@ async def upload_documents(
         d["content_sha256"]: d for d in existing_docs if d.get("content_sha256")
     }
     duplicate_files_skipped: List[Dict[str, Any]] = []
+    # Documents kept despite incomplete drug-name translation, so the response
+    # can say which medications will not take part in cross-checking.
+    language_degradations: List[Dict[str, Any]] = []
 
     with TemporaryDirectory() as tmp_dir:
         for upload in files:
@@ -297,20 +301,25 @@ async def upload_documents(
                     )
                     raise HTTPException(422, str(e))
 
-                # Reject a document whose language could not be normalized
-                # into the English fields cross-document matching depends on.
-                # Accepting it would leave its medications unmatchable
-                # against the rest of the record — a silent gap in the very
-                # cross-check the upload exists to feed, so it fails loudly
-                # here instead.
-                try:
-                    assert_supported_language(page, label)
-                except UnsupportedLanguageError as e:
+                # A document whose drug names could not all be normalized is
+                # KEPT, at a lowered confidence, with the unmatchable
+                # medications marked. Rejecting it outright discarded the
+                # medications that HAD resolved — for a photographed
+                # non-English prescription, partial translation is the normal
+                # result, so refusing the file made the common case the
+                # failing case. The gap is recorded on the record instead of
+                # being implied by the document's absence from it.
+                degraded = apply_language_degradation(page)
+                if degraded["degraded"]:
                     logger.warning(
-                        "upload_documents: user=%s rejected '%s' (language=%s): %s",
-                        user_id, label, e.detected_language, "; ".join(e.problems),
+                        "upload_documents: user=%s accepted '%s' with reduced "
+                        "confidence %.2f (language=%s): %d medication(s) unmatchable: %s",
+                        user_id, label, degraded["confidence"],
+                        degraded.get("document_language"),
+                        len(degraded["unmatched_medications"]),
+                        "; ".join(degraded["unmatched_medications"]),
                     )
-                    raise HTTPException(422, str(e))
+                    language_degradations.append({"file": label, **degraded})
 
                 # Stored so a later upload of this same file is recognised.
                 # Every page of a multi-page PDF carries its parent file's
@@ -609,6 +618,10 @@ async def upload_documents(
         "consult_triage": consult_triage,
         "translation_risk": translation_risk,
         "antidote_reference_notes": antidote_notes,
+        # Non-empty when a document was accepted at reduced confidence because
+        # some drug names could not be normalized. Each entry names the file,
+        # the medications that cannot be cross-checked, and why.
+        "language_degradations": language_degradations,
         # Present (and non-empty) when a re-uploaded file was recognised and
         # not added a second time.
         "duplicate_files_skipped": duplicate_files_skipped,

@@ -75,6 +75,38 @@ def _has_medical_content(doc: Dict[str, Any]) -> bool:
     return False
 
 
+_CONFIDENCE_MISSING = object()
+
+
+def _confidence_value(doc: Dict[str, Any]) -> float:
+    """The confidence used for the DECISION. Anything missing or non-numeric
+    counts as 0.0 — an unreported score is not evidence of a good read."""
+    raw = doc.get("overall_confidence", _CONFIDENCE_MISSING)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 0.0
+    return float(raw)
+
+
+def _describe_confidence(doc: Dict[str, Any]) -> str:
+    """How to TALK about that confidence in an error the user reads.
+
+    The decision coerces a missing or non-numeric score to 0.0, but saying so
+    verbatim produced messages that were plainly untrue: a document with no
+    score at all was reported as "overall_confidence=0.0" (implying the model
+    read it and had zero confidence), and a string score produced the
+    nonsense "overall_confidence=high is below 0.35". The decision is
+    unchanged; only the description is honest about which case it hit.
+    """
+    raw = doc.get("overall_confidence", _CONFIDENCE_MISSING)
+    if raw is _CONFIDENCE_MISSING:
+        return "no confidence score was reported for it"
+    if raw is None:
+        return "its confidence score came back empty"
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return f"its confidence score was {raw!r}, which is not a number"
+    return f"its confidence score of {raw} is below {LOW_CONFIDENCE_THRESHOLD}"
+
+
 def looks_like_medical_document(doc: Dict[str, Any]) -> bool:
     """
     Decides whether one extraction result (the dict returned by
@@ -105,10 +137,7 @@ def looks_like_medical_document(doc: Dict[str, Any]) -> bool:
         return True
 
     if doc_type in RECOGNIZED_MEDICAL_TYPES:
-        confidence = doc.get("overall_confidence", 0.0)
-        if not isinstance(confidence, (int, float)):
-            confidence = 0.0
-        return confidence >= LOW_CONFIDENCE_THRESHOLD
+        return _confidence_value(doc) >= LOW_CONFIDENCE_THRESHOLD
 
     return False
 
@@ -117,16 +146,15 @@ def rejection_reason(doc: Dict[str, Any]) -> str:
     """Human-readable explanation for why a document was rejected, for use
     in API error messages / logs."""
     doc_type = doc.get("document_type", "unknown")
-    confidence = doc.get("overall_confidence", 0.0)
     if doc_type not in RECOGNIZED_MEDICAL_TYPES:
         return (
-            f"classified as '{doc_type}' with no medications, lab results, or "
-            f"allergies found (overall_confidence={confidence})."
+            f"it was classified as '{doc_type}' and no medications, lab results "
+            f"or allergies were found in it."
         )
     return (
-        f"classified as '{doc_type}' but overall_confidence={confidence} is below "
-        f"{LOW_CONFIDENCE_THRESHOLD} and no medications, lab results, or allergies "
-        f"were found to support that label."
+        f"it was classified as '{doc_type}', but {_describe_confidence(doc)} "
+        f"and no medications, lab results or allergies were found to support "
+        f"that label."
     )
 
 

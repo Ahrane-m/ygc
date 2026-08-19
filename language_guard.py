@@ -202,6 +202,91 @@ def assert_supported_language(doc: Dict[str, Any], filename: str) -> None:
     )
 
 
+# A document whose drug names could not all be normalized is ACCEPTED, not
+# refused — but it is accepted at a confidence that says so. These ceilings
+# sit below LOW_TRANSLATION_CONFIDENCE (0.6) so the document is visibly
+# flagged everywhere confidence is displayed, and above document_filter's
+# 0.35 floor so degrading a document never causes a later stage to throw it
+# out as non-medical.
+UNTRANSLATED_DOC_CONFIDENCE = 0.4
+UNTRANSLATED_MED_CONFIDENCE = 0.3
+
+
+def apply_language_degradation(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Accepts a partially-translated document, marking what could not be
+    matched and lowering its confidence to match. Mutates `doc` in place and
+    returns a summary of what was degraded.
+
+    WHY ACCEPT RATHER THAN REJECT
+    -----------------------------
+    Refusing the whole file was the old behaviour and it was too blunt. A
+    Hindi prescription listing Metformin (resolved cleanly to its INN) beside
+    one Devanagari name the model could not map was thrown away in full —
+    losing the medication that WAS usable along with the one that was not.
+    Partial translation is the normal outcome for a photographed non-English
+    prescription, not an exceptional one, so rejection made the common case
+    the failing case.
+
+    The original concern still stands: an unmatched drug name cannot be
+    cross-checked, so it silently disappears from the duplicate and
+    interaction checks. That is why this is a degradation and not a shrug.
+    Each affected medication is marked `cross_check_eligible: False` with the
+    reason attached, so the gap is visible in the record instead of implied
+    by absence, and the confidence attached to the document says plainly that
+    part of it could not be read into the standard form.
+    """
+    problems = detect_language_problems(doc)
+    if not problems:
+        return {"degraded": False, "problems": [], "unmatched_medications": []}
+
+    unmatched: List[str] = []
+    for med in doc.get("medications") or []:
+        name = (med.get("name") or "").strip()
+        ingredients = [i for i in (med.get("ingredients") or []) if i and i.strip()]
+        untranslated = [i for i in ingredients if not _is_latin_script(i)]
+        # Same two failure shapes detect_language_problems() reports: an
+        # ingredient still in the source script, or a non-Latin printed name
+        # with no ingredient resolved at all.
+        if untranslated or (not ingredients and name and _has_letters(name)
+                            and not _is_latin_script(name)):
+            med["cross_check_eligible"] = False
+            med["unmatched_reason"] = (
+                "This drug name could not be converted to the standard English "
+                "name, so it cannot be compared against your other records."
+            )
+            existing = med.get("confidence")
+            med["confidence"] = min(
+                existing if isinstance(existing, (int, float)) and not isinstance(existing, bool)
+                else UNTRANSLATED_MED_CONFIDENCE,
+                UNTRANSLATED_MED_CONFIDENCE,
+            )
+            unmatched.append(name or "unnamed")
+
+    current = doc.get("overall_confidence")
+    doc["overall_confidence"] = min(
+        current if isinstance(current, (int, float)) and not isinstance(current, bool)
+        else UNTRANSLATED_DOC_CONFIDENCE,
+        UNTRANSLATED_DOC_CONFIDENCE,
+    )
+    doc["translation_incomplete"] = True
+    doc["translation_problems"] = problems
+
+    return {
+        "degraded": True,
+        "problems": problems,
+        "unmatched_medications": unmatched,
+        "document_language": doc.get("document_language"),
+        "confidence": doc["overall_confidence"],
+        "message": (
+            f"{len(unmatched)} medication name(s) on this document could not be "
+            "converted to their standard English names, so they are stored but "
+            "cannot be cross-checked against your other records. The rest of the "
+            "document was read normally."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Graduated red flag
 #
