@@ -1370,7 +1370,7 @@ if __name__ == "__main__":
     # people sitting in the same folder) from being merged into one
     # timeline and cross-checked against each other.
     print("\nGrouping documents by patient ...")
-    patient_groups = group_documents_by_patient(all_results, drop_demo_documents=True)
+    patient_groups = group_documents_by_patient(all_results, drop_demo_documents=False)
 
     if not patient_groups:
         print("No real (non-demo) documents remained after filtering. Exiting.")
