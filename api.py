@@ -54,7 +54,11 @@ import graph_db
 import storage
 from auth import get_current_user
 from consult_triage import TRIAGE_OUTPUT_VERSION, triage_consultation
-from document_filter import NonMedicalDocumentError, assert_medical_document
+from document_filter import (
+    NonMedicalDocumentError,
+    assert_medical_document,
+    has_medical_content,
+)
 from evidence_grading import graph_backed_findings_from_antidotes
 from identity_guard import partition_identity_mismatch
 from language_guard import (
@@ -199,6 +203,9 @@ async def upload_documents(
     # Documents kept despite incomplete drug-name translation, so the response
     # can say which medications will not take part in cross-checking.
     language_degradations: List[Dict[str, Any]] = []
+    # Why each page was dropped, so a "nothing usable" response can say what
+    # actually happened instead of guessing at one cause.
+    skipped_pages: List[str] = []
 
     with TemporaryDirectory() as tmp_dir:
         for upload in files:
@@ -294,16 +301,31 @@ async def upload_documents(
                 # real data and that is recorded, because "we let this in"
                 # and "we never noticed" must not look the same afterwards.
                 if _is_demo_document(page):
-                    if SKIP_DEMO_DOCUMENTS:
-                        logger.warning(
-                            "upload_documents: user=%s skipped demo/placeholder page '%s'",
-                            user_id, label,
+                    # A placeholder marker is a hint about the NAME printed on
+                    # the page; extracted medications, lab results and
+                    # allergies are evidence about its CONTENT. Content wins.
+                    # A real prescription belonging to someone surnamed
+                    # Demonte, or a lab report whose patient field caught
+                    # "Sample Collected", is a medical document whatever the
+                    # marker says — and dropping it was invisible to the
+                    # person who uploaded it.
+                    if SKIP_DEMO_DOCUMENTS and not has_medical_content(page):
+                        reason = (
+                            "matched a demo/placeholder marker and contained no "
+                            "medications, lab results or allergies"
                         )
+                        logger.warning(
+                            "upload_documents: user=%s skipped page '%s': %s",
+                            user_id, label, reason,
+                        )
+                        skipped_pages.append(f"'{label}' {reason}")
                         continue
                     logger.info(
                         "upload_documents: user=%s '%s' matches a demo/placeholder "
-                        "marker but SKIP_DEMO_DOCUMENTS is off — keeping it as real data",
+                        "marker but %s — keeping it",
                         user_id, label,
+                        "it contains real medical content" if has_medical_content(page)
+                        else "SKIP_DEMO_DOCUMENTS is off",
                     )
                 try:
                     assert_medical_document(page, label)
@@ -372,11 +394,26 @@ async def upload_documents(
                     "antidote_reference_notes": [],
                     "indexed": True,
                 }
-            raise HTTPException(
-                422,
-                "No medical content found in the uploaded file(s) (all pages were "
-                "demo/placeholder documents).",
-            )
+            # This used to assert "all pages were demo/placeholder documents"
+            # regardless of what actually happened. Once a placeholder marker
+            # stopped dropping pages that carry medical content, that
+            # explanation became not just unhelpful but wrong — it named a
+            # cause that can no longer occur on its own, and sent anyone
+            # debugging a genuinely unreadable PDF looking in the wrong place.
+            # The reason is now whatever the reason was.
+            if skipped_pages:
+                detail = (
+                    "No usable content was found in the uploaded file(s): "
+                    + "; ".join(skipped_pages)
+                )
+            else:
+                detail = (
+                    "No pages could be read from the uploaded file(s). The file "
+                    "may be empty, corrupt, or password-protected — try opening "
+                    "it and re-saving, or upload a clearer scan."
+                )
+            logger.warning("upload_documents: user=%s no pages kept: %s", user_id, detail)
+            raise HTTPException(422, detail)
 
         # Check the newly-extracted patient identity (name, fuzzy-matched;
         # age, via inferred birth year so it tolerates the patient aging
