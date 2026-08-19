@@ -65,6 +65,7 @@ from language_guard import (
 )
 from lab_trends import track_lab_trends
 from medical_extractor import (
+    SKIP_DEMO_DOCUMENTS,
     _is_demo_document,
     build_patient_timeline,
     cross_check_inputs_fingerprint,
@@ -288,11 +289,22 @@ async def upload_documents(
             kept_pages: List[Tuple[str, Dict[str, Any]]] = []
             for page_num, page in enumerate(pages, start=1):
                 label = upload.filename if len(pages) == 1 else f"{upload.filename} (page {page_num})"
+                # Detection always runs; only the DROP is gated. When
+                # skipping is off, a placeholder-looking page is admitted as
+                # real data and that is recorded, because "we let this in"
+                # and "we never noticed" must not look the same afterwards.
                 if _is_demo_document(page):
-                    logger.warning(
-                        "upload_documents: user=%s skipped demo/placeholder page '%s'", user_id, label,
+                    if SKIP_DEMO_DOCUMENTS:
+                        logger.warning(
+                            "upload_documents: user=%s skipped demo/placeholder page '%s'",
+                            user_id, label,
+                        )
+                        continue
+                    logger.info(
+                        "upload_documents: user=%s '%s' matches a demo/placeholder "
+                        "marker but SKIP_DEMO_DOCUMENTS is off — keeping it as real data",
+                        user_id, label,
                     )
-                    continue
                 try:
                     assert_medical_document(page, label)
                 except NonMedicalDocumentError as e:

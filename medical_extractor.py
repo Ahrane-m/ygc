@@ -568,6 +568,21 @@ def _flatten_documents(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]
 # so an English-only check misses a demo document printed in another
 # language. This list can't cover every language a patient's documents
 # might be in — it's a pragmatic net for the common cases, not a guarantee.
+# Demo/placeholder SKIPPING is off by default. Detection below still runs and
+# still reports what it finds — the switch controls whether a matching page is
+# dropped, not whether it is recognised.
+#
+# It is off because the cost of a false positive is silent and total: a page
+# skipped here never reaches the record, and the only signal is a log line the
+# uploader never sees. Set SKIP_DEMO_DOCUMENTS=true to restore dropping, e.g.
+# when loading a vendor sample pack that genuinely contains mock pages.
+#
+# With it off, a page that looks like a placeholder is admitted as real
+# patient data and logged as such, so the decision is visible either way.
+SKIP_DEMO_DOCUMENTS = os.getenv("SKIP_DEMO_DOCUMENTS", "false").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
 DEMO_PLACEHOLDER_MARKERS = frozenset({
     "DEMO", "SAMPLE", "DUMMY", "TEST PATIENT", "PLACEHOLDER",   # English
     "மாதிரி", "டெமோ",                                             # Tamil (sample / demo)
@@ -669,7 +684,7 @@ def find_patient_name_mismatch(
 
 
 def group_documents_by_patient(
-    raw_results: List[Dict[str, Any]], drop_demo_documents: bool = True
+    raw_results: List[Dict[str, Any]], drop_demo_documents: bool = SKIP_DEMO_DOCUMENTS
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Splits a flat list of extracted documents into groups keyed by patient
