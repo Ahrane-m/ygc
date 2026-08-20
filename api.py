@@ -59,7 +59,10 @@ from document_filter import (
     assert_medical_document,
     has_medical_content,
 )
-from evidence_grading import graph_backed_findings_from_antidotes
+from evidence_grading import (
+    derived_references_from_interactions,
+    graph_backed_findings_from_antidotes,
+)
 from identity_guard import partition_identity_mismatch
 from language_guard import (
     UnsupportedLanguageError,
@@ -512,6 +515,36 @@ async def upload_documents(
         )
     graph_backed_findings = graph_backed_findings_from_antidotes(antidote_references)
 
+    # Shared-enzyme pairs from the FDA CYP/transporter table. Kept in their
+    # own channel rather than folded into graph_backed_findings: that channel
+    # grades reference_graph and leaves confidence uncapped, and nothing in
+    # the FDA table states that two drugs interact — it records each drug's
+    # enzyme role separately. The join is ours, so the finding is graded
+    # derived_reference and flagged for clinical review instead of being
+    # dressed up as a citation.
+    #
+    # Fails open like every other graph call: no graph simply means these
+    # findings stay at model_knowledge, which is the honest default.
+    derived_references: Dict[str, Dict[str, Any]] = {}
+    try:
+        from interactions_kg import potential_interactions
+
+        pairs = potential_interactions(med_names)
+        derived_references = derived_references_from_interactions(pairs)
+        if pairs:
+            logger.info(
+                "upload_documents: user=%s FDA enzyme table derived %d potential "
+                "pharmacokinetic pair(s) among %d medication name(s): %s",
+                user_id, len(pairs), len(med_names),
+                "; ".join(f"{p['affecting_drug']}->{p['affected_drug']} "
+                          f"via {p['shared_pathways']}" for p in pairs[:5]),
+            )
+    except Exception as e:
+        logger.warning(
+            "upload_documents: user=%s interaction reference lookup skipped, "
+            "continuing without it: %s", user_id, e,
+        )
+
     # The cross-check is the single most expensive step in an upload (~44s on
     # a real record, about half the request). It is a pure function of the
     # medication timeline plus allergies, so an upload that leaves both
@@ -545,6 +578,7 @@ async def upload_documents(
         cross_check = await asyncio.to_thread(
             cross_check_prescriptions, timeline,
             graph_backed_findings=graph_backed_findings,
+            derived_references=derived_references,
         )
 
     issue_count = sum(len(v) for v in cross_check.values() if isinstance(v, list))
@@ -560,9 +594,11 @@ async def upload_documents(
         )
     logger.info(
         "upload_documents: user=%s timeline rebuilt, cross-check found %d issue(s) "
-        "(evidence: %d deterministic, %d reference-graph, %d unverified model knowledge)",
+        "(evidence: %d deterministic, %d reference-graph, %d derived-reference, "
+        "%d unverified model knowledge)",
         user_id, issue_count, evidence.get("deterministic", 0),
-        evidence.get("reference_graph", 0), evidence.get("model_knowledge", 0),
+        evidence.get("reference_graph", 0), evidence.get("derived_reference", 0),
+        evidence.get("model_knowledge", 0),
     )
 
     # Demographics for the single-reading assessments are read off the

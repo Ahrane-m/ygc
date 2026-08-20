@@ -57,6 +57,19 @@ MODEL_KNOWLEDGE_CONFIDENCE_CEILING = 0.6
 DETERMINISTIC = "deterministic"
 REFERENCE_GRAPH = "reference_graph"
 MODEL_KNOWLEDGE = "model_knowledge"
+# A pair DERIVED by joining two separately-quoted reference statements —
+# "drug A is a CYP3A substrate" and "drug B is a strong CYP3A inhibitor" —
+# rather than a source stating the two interact. Sits between the other
+# grades because that is honestly where it belongs: the mechanism is quoted,
+# the pairing is inferred.
+#
+# It gets a higher ceiling than model_knowledge because two verbatim FDA rows
+# stand behind the mechanism, and a lower one than reference_graph because no
+# document says these drugs interact. Shared enzymes are common and most
+# theoretical pairs are clinically unremarkable, so the finding also carries
+# requires_clinical_review.
+DERIVED_REFERENCE = "derived_reference"
+DERIVED_REFERENCE_CONFIDENCE_CEILING = 0.75
 
 # Finding lists in a cross_check report, and whether each is about drugs whose
 # names can be matched against the reference graph.
@@ -97,10 +110,17 @@ def _finding_drug_names(finding: Dict[str, Any]) -> Set[str]:
     return names
 
 
+def _pair_key(names: List[str]) -> Optional[str]:
+    """Order-independent key for a two-drug finding."""
+    unique = sorted({(n or "").strip().lower() for n in names if n and n.strip()})
+    return "|".join(unique) if len(unique) == 2 else None
+
+
 def grade_finding(
     finding: Dict[str, Any],
     graph_backed_findings: Optional[Dict[str, Dict[str, Any]]] = None,
     claim_reference: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    derived_references: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Grades one finding in place and returns it.
@@ -150,6 +170,31 @@ def grade_finding(
         finding["evidence_note"] = REFERENCE_GRAPH_NOTE
         return finding
 
+    # Checked only after the per-drug graph hit, so nothing that already
+    # grades reference_graph is downgraded by adding this tier.
+    pair = _pair_key(_finding_drug_names(finding))
+    derived = (derived_references or {}).get(pair) if pair else None
+    if derived:
+        finding["evidence_source"] = DERIVED_REFERENCE
+        finding["grounded"] = True
+        finding["reference"] = derived
+        finding["requires_clinical_review"] = True
+        finding["evidence_note"] = (
+            "The mechanism is quoted from a published reference — each drug's "
+            "enzyme role is recorded there — but the source does not state that "
+            "these two drugs interact; that pairing is derived from the shared "
+            "pathway and needs clinical confirmation."
+        )
+        raw = finding.get("confidence")
+        ceiling = DERIVED_REFERENCE_CONFIDENCE_CEILING
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            if float(raw) > ceiling:
+                finding["model_reported_confidence"] = round(float(raw), 2)
+            finding["confidence"] = round(min(float(raw), ceiling), 2)
+        else:
+            finding["confidence"] = ceiling
+        return finding
+
     finding["evidence_source"] = MODEL_KNOWLEDGE
     finding["grounded"] = False
     finding["evidence_note"] = MODEL_KNOWLEDGE_NOTE
@@ -174,6 +219,7 @@ def grade_cross_check(
     cross_check: Dict[str, Any],
     graph_backed_findings: Optional[Dict[str, Dict[str, Any]]] = None,
     claim_reference: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    derived_references: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Grades every finding in a cross_check report, in place, and adds an
@@ -184,13 +230,15 @@ def grade_cross_check(
     naming one of those drugs is graded `reference_graph` and keeps its
     confidence uncapped.
     """
-    counts = {DETERMINISTIC: 0, REFERENCE_GRAPH: 0, MODEL_KNOWLEDGE: 0}
+    counts = {DETERMINISTIC: 0, REFERENCE_GRAPH: 0,
+              DERIVED_REFERENCE: 0, MODEL_KNOWLEDGE: 0}
 
     for list_name in FINDING_LISTS:
         for finding in cross_check.get(list_name) or []:
             if not isinstance(finding, dict):
                 continue
-            grade_finding(finding, graph_backed_findings, claim_reference)
+            grade_finding(finding, graph_backed_findings, claim_reference,
+                          derived_references)
             counts[finding["evidence_source"]] += 1
 
     total = sum(counts.values())
@@ -198,10 +246,11 @@ def grade_cross_check(
         "total_findings": total,
         "deterministic": counts[DETERMINISTIC],
         "reference_graph": counts[REFERENCE_GRAPH],
+        "derived_reference": counts[DERIVED_REFERENCE],
         "model_knowledge": counts[MODEL_KNOWLEDGE],
         "model_knowledge_confidence_ceiling": MODEL_KNOWLEDGE_CONFIDENCE_CEILING,
         "note": (
-            f"{counts[DETERMINISTIC] + counts[REFERENCE_GRAPH]} of {total} finding(s) "
+            f"{counts[DETERMINISTIC] + counts[REFERENCE_GRAPH] + counts[DERIVED_REFERENCE]} of {total} finding(s) "
             "are backed by the patient's own records or by an ingested reference "
             f"document. The other {counts[MODEL_KNOWLEDGE]} come from the language "
             "model's own knowledge with nothing in this system confirming them, so "
@@ -234,6 +283,37 @@ def graph_backed_findings_from_antidotes(
             "source": "WHO Model List of Essential Medicines (antidotes section)",
             "display_name": ref.get("display_name"),
             "listings": ref.get("listings", []),
+        }
+    return backed
+
+
+def derived_references_from_interactions(
+    pairs: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Adapts interactions_kg.potential_interactions() output into the
+    `derived_references` shape keyed by drug pair.
+
+    Deliberately NOT routed through `graph_backed_findings`, which grades
+    reference_graph and leaves confidence uncapped. Nothing in the FDA table
+    says these two drugs interact — it records each drug's enzyme role
+    separately, and the pairing is a join. Grading that as a citation would
+    make an inference indistinguishable from a quote.
+    """
+    backed: Dict[str, Dict[str, Any]] = {}
+    for pair in pairs or []:
+        key = _pair_key([pair.get("affecting_drug"), pair.get("affected_drug")])
+        if not key:
+            continue
+        backed[key] = {
+            "source": pair.get("source"),
+            "source_url": pair.get("source_url"),
+            "shared_pathways": pair.get("shared_pathways"),
+            "mechanism": pair.get("mechanism"),
+            "strength": pair.get("strength"),
+            "derivation": pair.get("derivation"),
+            "pathways": pair.get("pathways", []),
+            "requires_clinical_review": True,
         }
     return backed
 

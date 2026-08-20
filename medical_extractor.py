@@ -1190,7 +1190,7 @@ def detect_exact_duplicate_medications(timeline: Dict[str, Any]) -> List[Dict[st
 # something happened to change their medication list. Folding this version
 # into the hash makes every stored snapshot miss once after a change, recompute,
 # and then reuse normally.
-CROSS_CHECK_ANALYSIS_VERSION = "2026-08-16.guideline-reference"
+CROSS_CHECK_ANALYSIS_VERSION = "2026-08-20.derived-interaction-evidence"
 
 
 def cross_check_inputs_fingerprint(timeline: Dict[str, Any]) -> str:
@@ -1265,6 +1265,7 @@ def cross_check_prescriptions(
     timeline: Dict[str, Any],
     model: str = MODEL,
     graph_backed_findings: Optional[Dict[str, Dict[str, Any]]] = None,
+    derived_references: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Runs interaction / duplicate / dosage-conflict / allergy cross-checking
@@ -1335,7 +1336,9 @@ def cross_check_prescriptions(
     # instead of being capped alongside the model's unverifiable recall.
     from evidence_grading import grade_cross_check
     from reference_library import samhsa_claim_reference
-    grade_cross_check(result, graph_backed_findings, claim_reference=samhsa_claim_reference)
+    grade_cross_check(result, graph_backed_findings,
+                      claim_reference=samhsa_claim_reference,
+                      derived_references=derived_references)
 
     # Place every finding in time. Two drugs only interact if the patient was
     # taking them at the same time, and the model compares a flat list with no

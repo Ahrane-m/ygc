@@ -596,6 +596,20 @@ def _render_safety_flags(cross_check: Dict[str, Any]) -> str:
             return " [VERIFIED from the patient's own records]"
         if source == "reference_graph":
             return " [BACKED BY a reference document in the knowledge graph]"
+        if source == "derived_reference":
+            # Falling through to "" here would have been the worst outcome
+            # available: an inferred pairing presented with no qualifier at
+            # all reads as settled fact, which is a stronger claim than
+            # either of the labels above.
+            ref = item.get("reference") or {}
+            pathways = ref.get("shared_pathways")
+            via = f" (shared pathway: {pathways})" if pathways else ""
+            return (
+                f" [DERIVED{via} — a reference document records what each drug does "
+                "to this pathway, but does NOT state that these two interact; that "
+                "pairing was inferred here and needs a clinician to confirm it. Say "
+                "so if you rely on it]"
+            )
         if source == "model_knowledge":
             return (
                 " [UNVERIFIED — general medical knowledge, not confirmed by any "
@@ -1127,12 +1141,19 @@ RULES:
   overlap and give the dates. For one marked TAKEN TOGETHER, state the period
   it was live ("between 9 and 23 November 2025"). Never warn about a drug pair
   as if it were current when the record shows the courses were years apart.
-- Safety findings are marked VERIFIED, BACKED BY a reference document, or
-  UNVERIFIED. Never present an UNVERIFIED finding as established fact: say
-  plainly that it comes from general medical knowledge and has not been
-  checked against a drug-interaction database, and that a pharmacist can
-  confirm it. Do not "upgrade" it by sounding certain, and do not dismiss it
-  either — unverified means unconfirmed, not wrong.
+- Safety findings are marked VERIFIED, BACKED BY a reference document,
+  DERIVED, or UNVERIFIED. Report the one the finding actually carries.
+  - UNVERIFIED: never present it as established fact. Say plainly that it
+    comes from general medical knowledge and has not been checked against a
+    drug-interaction database, and that a pharmacist can confirm it. Do not
+    "upgrade" it by sounding certain, and do not dismiss it either —
+    unverified means unconfirmed, not wrong.
+  - DERIVED: a reference document records what each drug does to a shared
+    pathway, but does NOT say the two interact — that pairing was worked out
+    here. Name the shared pathway if one is given, and say the combination
+    needs a clinician to confirm it. Never describe a DERIVED finding as
+    something a source states, documents, or confirms; the mechanism is
+    documented, the pairing is not.
 - When asked WHO to see, how urgently, or which kind of doctor, answer from
   the "CONSULTATION ROUTING" section — it was computed over the whole record
   and is the pipeline's own routing. Do not substitute your own judgment of

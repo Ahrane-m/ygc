@@ -107,6 +107,25 @@ def _describe_confidence(doc: Dict[str, Any]) -> str:
     return f"its confidence score of {raw} is below {LOW_CONFIDENCE_THRESHOLD}"
 
 
+def _carries_demo_marker(doc: Dict[str, Any]) -> bool:
+    """Whether this page carries a demo/placeholder marker.
+
+    api.py stamps `is_demo_document` before calling this module, so the flag
+    is normally already there. The fallback keeps the function correct for
+    any other caller, and imports locally because medical_extractor pulls in
+    the OpenAI client and this module is deliberately dependency-free.
+    """
+    flag = doc.get("is_demo_document")
+    if isinstance(flag, bool):
+        return flag
+    try:
+        from medical_extractor import _is_demo_document
+
+        return _is_demo_document(doc)
+    except Exception:
+        return False
+
+
 def looks_like_medical_document(doc: Dict[str, Any]) -> bool:
     """
     Decides whether one extraction result (the dict returned by
@@ -137,6 +156,19 @@ def looks_like_medical_document(doc: Dict[str, Any]) -> bool:
         return True
 
     if doc_type in RECOGNIZED_MEDICAL_TYPES:
+        # A demo/sample document typed as a real clinical document is
+        # accepted without the confidence floor.
+        #
+        # The floor exists to catch a boarding pass the vision model mislabels
+        # as a prescription: no clinical content AND no confidence in the
+        # label. A demo marker is evidence pointing the other way — someone
+        # deliberately made a prescription-shaped document — and the very
+        # things that trip the floor (blank placeholder rows, a low-confidence
+        # read of a mock layout) are what a template IS, not evidence it is
+        # something else. A marker never rescues a document typed 'other';
+        # that remains the genuine junk bucket.
+        if _carries_demo_marker(doc):
+            return True
         return _confidence_value(doc) >= LOW_CONFIDENCE_THRESHOLD
 
     return False
@@ -297,5 +329,27 @@ if __name__ == "__main__":
         raise SystemExit("expected NonMedicalDocumentError to be raised")
     except NonMedicalDocumentError as e:
         print("OK — correctly rejected:", e)
+
+    # --- demo/sample documents are accepted, junk still is not ----------
+    base = {"lab_results": [], "allergies_noted": [], "clinical_notes": None,
+            "medications": [], "recommended_investigations": []}
+    # A demo prescription is prescription-SHAPED: blank placeholder rows and a
+    # low-confidence read of a mock layout are what a template is, not
+    # evidence it is something else.
+    assert looks_like_medical_document(
+        {**base, "document_type": "prescription", "is_demo_document": True,
+         "overall_confidence": 0.2})
+    # Without the marker, the same empty low-confidence page is still junk.
+    assert not looks_like_medical_document(
+        {**base, "document_type": "prescription", "is_demo_document": False,
+         "overall_confidence": 0.2})
+    # A marker never rescues 'other' — that is the boarding-pass bucket.
+    assert not looks_like_medical_document(
+        {**base, "document_type": "other", "is_demo_document": True,
+         "clinical_notes": "Gate 42 seat 14C", "overall_confidence": 0.9})
+    # The flag is derived when a caller has not stamped it.
+    assert looks_like_medical_document(
+        {**base, "document_type": "prescription", "patient_name": "DEMO PATIENT",
+         "overall_confidence": 0.2})
 
     print("All checks passed.")
