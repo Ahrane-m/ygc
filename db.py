@@ -79,7 +79,7 @@ def ensure_indexes() -> None:
     _sessions().create_index([("user_id", 1), ("session_id", 1)], unique=True)
 
 
-def _now_iso() -> str:
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -94,11 +94,16 @@ def load_documents(user_id: str) -> List[Dict[str, Any]]:
 def insert_documents(user_id: str, docs: List[Dict[str, Any]]) -> None:
     """Appends newly-extracted documents for this user (append-only — never
     rewrites or touches this user's existing documents). No-op on an empty
-    list."""
+    list.
+
+    Preserves a caller-supplied `uploaded_at` (set at upload time, before
+    the timeline is built from these same docs) rather than overwriting it
+    here — otherwise the timestamp baked into the patient snapshot and the
+    one actually stored on the document record would disagree."""
     if not docs:
         return
-    now = _now_iso()
-    records = [{**d, "user_id": user_id, "uploaded_at": now} for d in docs]
+    now = now_iso()
+    records = [{"uploaded_at": now, **d, "user_id": user_id} for d in docs]
     _documents().insert_many(records)
 
 
@@ -126,7 +131,7 @@ def save_patient_snapshot(
         "user_id": user_id,
         "patient_timeline": timeline,
         "cross_check_report": cross_check,
-        "updated_at": _now_iso(),
+        "updated_at": now_iso(),
     }
     if lab_trends is not None:
         fields["lab_trends"] = lab_trends
@@ -171,9 +176,9 @@ def save_session(
                 "focus": focus or {},
                 "summary": summary,
                 "summary_covers_up_to": summary_covers_up_to,
-                "updated_at": _now_iso(),
+                "updated_at": now_iso(),
             },
-            "$setOnInsert": {"created_at": _now_iso()},
+            "$setOnInsert": {"created_at": now_iso()},
         },
         upsert=True,
     )

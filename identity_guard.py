@@ -71,6 +71,21 @@ def normalize_name(name: Optional[str]) -> Optional[str]:
     medical_extractor.py."""
     if not name or not name.strip():
         return None
+    # A demo/placeholder name is not a different patient's name — it is the
+    # absence of a name, and it is treated the same as a blank one.
+    #
+    # Comparing "DEMO PATIENT" against the real patient on file produced a
+    # confident mismatch and held the document back, which meant a sample
+    # document could never be added to an account that already had real
+    # records. That reading is wrong on its own terms: a placeholder carries
+    # no identity information, so it is no evidence that the document belongs
+    # to someone else. Returning None here lets the age/gender corroboration
+    # in _score_cluster() decide on its own merits, exactly as it does for a
+    # document whose name could not be read at all.
+    from medical_extractor import _matches_demo_marker
+
+    if _matches_demo_marker(name):
+        return None
     cleaned = _TITLE_PREFIX_RE.sub("", name.strip())
     cleaned = _PUNCTUATION_RE.sub(" ", cleaned)
     cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip().lower()

@@ -462,11 +462,20 @@ async def upload_documents(
         # Cloudinary once, and attach the resulting URL to every page that
         # came from it. Held-back files are skipped entirely; their temp
         # files are simply discarded when this `with` block exits.
+        #
+        # uploaded_at is stamped here (one timestamp for the whole batch)
+        # rather than left for db.insert_documents() to set later, because
+        # build_patient_timeline() below runs BEFORE that insert — without
+        # this, the snapshot saved from THIS request would carry visits
+        # with no uploaded_at at all, only gaining one retroactively once
+        # a later upload rebuilds the timeline from the now-saved records.
+        batch_uploaded_at = db.now_iso()
         for tmp_path, filename, kept_pages in proceeding_file_pages:
             upload_info = storage.upload_patient_document(user_id, str(tmp_path), filename)
             for label, page in kept_pages:
                 page["document_url"] = upload_info["document_url"]
                 page["cloudinary_public_id"] = upload_info["cloudinary_public_id"]
+                page["uploaded_at"] = batch_uploaded_at
                 new_docs.append(page)
 
     all_docs = existing_docs + new_docs

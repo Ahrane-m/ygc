@@ -414,7 +414,7 @@ def _warrants_specialty(item: Dict[str, Any]) -> bool:
 # a "Heart specialist" no matter how many times they re-uploaded. Checking a
 # stored version against this one turns that silent staleness into a cheap
 # recompute.
-TRIAGE_OUTPUT_VERSION = "2026-08-18.specialist-titles"
+TRIAGE_OUTPUT_VERSION = "2026-08-20.always-name-a-doctor"
 
 
 def _article(word: str) -> str:
@@ -1228,6 +1228,29 @@ def triage_consultation(
 
     specialties = _collect_specialties(items)
 
+    # Telling someone to see a doctor without saying WHICH doctor is an
+    # unfinished instruction, and an empty list gives a caller nothing to
+    # render at all — the reader is left to work out where to go.
+    #
+    # _warrants_specialty() withholds a SPECIALIST here deliberately: a drug
+    # pairing from a course that ended two years ago needs no hepatologist,
+    # and naming one would spend a strong signal on something that is not a
+    # live risk. But a general practitioner is not a specialist referral. It
+    # is the ordinary answer, and for exactly these findings it is the right
+    # one. So the list always names someone, and specialty_note below says
+    # why it is not someone more specific.
+    no_specialist_warranted = bool(doctor_items) and not specialties
+    if no_specialist_warranted:
+        specialties = [{
+            "specialty": GENERAL_PRACTITIONER,
+            "plain_name": GENERAL_PRACTITIONER_PLAIN,
+            "reason": GP_FIRST_REASON,
+            "confidence": max((i["confidence"] for i in doctor_items), default=0.7),
+            "basis": "default",
+            "urgency": urgency,
+            "triggered_by": sorted({i["subject"] for i in doctor_items if i.get("subject")}),
+        }]
+
     # One line, plain, imperative — what to do and by when. Everything else in
     # this result is detail behind it.
     if not items and quality_items:
@@ -1263,7 +1286,7 @@ def triage_consultation(
     # a caller can tell "we didn't name one because none is warranted" apart
     # from "the specialty step failed".
     specialty_note = None
-    if doctor_items and not specialties:
+    if no_specialist_warranted:
         specialty_note = (
             "No particular kind of doctor is suggested: nothing here is a safety "
             "problem or an out-of-range result, so a general appointment is the right "
@@ -1662,8 +1685,16 @@ if __name__ == "__main__":
     assert drifting_only["consult_needed"] is True
     assert drifting_only["consult_type"] == "doctor"
     assert drifting_only["urgency"] == "routine"
-    assert drifting_only["recommended_specialties"] == [], drifting_only["recommended_specialties"]
-    assert drifting_only["specialty_note"], "an empty list needs explaining"
+    # A doctor is always NAMED — telling someone to see a doctor without
+    # saying which one leaves them nowhere to go, and hands a caller an empty
+    # list to render. What is withheld here is a SPECIALIST, not a doctor.
+    named = drifting_only["recommended_specialties"]
+    assert [e["specialty"] for e in named] == [GENERAL_PRACTITIONER], named
+    assert named[0]["basis"] == "default"
+    assert "regular doctor" in drifting_only["headline"], drifting_only["headline"]
+    assert drifting_only["specialty_note"], "declining to name a specialist needs explaining"
+    # The ITEM still carries no specialty: the GP is the overall answer, not a
+    # claim that this particular drifting result needs one.
     assert drifting_only["referral_items"][0]["specialty"] is None
     assert "not outside the normal range" in drifting_only["referral_items"][0][
         "specialty_omitted_because"].replace("nothing here is outside", "not outside")
@@ -1714,8 +1745,14 @@ if __name__ == "__main__":
         ]},
         use_llm=False,
     )
-    assert historical_only["recommended_specialties"] == [], historical_only
+    # A historical pairing names the regular doctor, never a specialist:
+    # courses that never overlapped were not a live risk, so there is nothing
+    # for a specialist to act on — but the reader is still told where to go.
+    assert [e["specialty"] for e in historical_only["recommended_specialties"]] == [
+        GENERAL_PRACTITIONER], historical_only["recommended_specialties"]
+    assert historical_only["specialty_note"]
     assert historical_only["referral_items"][0]["is_historical"] is True
+    assert historical_only["referral_items"][0]["specialty"] is None
 
     # A genuine, current interaction still gets one.
     live_alert = triage_consultation(
