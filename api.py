@@ -69,7 +69,6 @@ from language_guard import (
 )
 from lab_trends import track_lab_trends
 from medical_extractor import (
-    SKIP_DEMO_DOCUMENTS,
     _is_demo_document,
     build_patient_timeline,
     cross_check_inputs_fingerprint,
@@ -206,6 +205,9 @@ async def upload_documents(
     # Why each page was dropped, so a "nothing usable" response can say what
     # actually happened instead of guessing at one cause.
     skipped_pages: List[str] = []
+    # Pages carrying a demo/placeholder marker. They are ADDED like any
+    # other; this only records which ones they were.
+    demo_documents: List[str] = []
 
     with TemporaryDirectory() as tmp_dir:
         for upload in files:
@@ -297,35 +299,27 @@ async def upload_documents(
             for page_num, page in enumerate(pages, start=1):
                 label = upload.filename if len(pages) == 1 else f"{upload.filename} (page {page_num})"
                 # Detection always runs; only the DROP is gated. When
-                # skipping is off, a placeholder-looking page is admitted as
-                # real data and that is recorded, because "we let this in"
-                # and "we never noticed" must not look the same afterwards.
-                if _is_demo_document(page):
-                    # A placeholder marker is a hint about the NAME printed on
-                    # the page; extracted medications, lab results and
-                    # allergies are evidence about its CONTENT. Content wins.
-                    # A real prescription belonging to someone surnamed
-                    # Demonte, or a lab report whose patient field caught
-                    # "Sample Collected", is a medical document whatever the
-                    # marker says — and dropping it was invisible to the
-                    # person who uploaded it.
-                    if SKIP_DEMO_DOCUMENTS and not has_medical_content(page):
-                        reason = (
-                            "matched a demo/placeholder marker and contained no "
-                            "medications, lab results or allergies"
-                        )
-                        logger.warning(
-                            "upload_documents: user=%s skipped page '%s': %s",
-                            user_id, label, reason,
-                        )
-                        skipped_pages.append(f"'{label}' {reason}")
-                        continue
+                # CLASSIFY, never skip. A placeholder marker is recorded on
+                # the page and the page is kept either way — demo and real
+                # documents are both added, and the record says which is
+                # which.
+                #
+                # Skipping was removed rather than merely defaulted off. It
+                # failed silently and totally: the page never reached the
+                # record and the only trace was a log line the uploader never
+                # saw, so a real prescription belonging to someone surnamed
+                # Demonte, or a lab report whose patient field caught "Sample
+                # Collected", simply vanished. A flag on the document gives a
+                # reader the same information with none of that cost, and
+                # cannot be re-enabled by a stale environment variable.
+                page["is_demo_document"] = _is_demo_document(page)
+                if page["is_demo_document"]:
+                    demo_documents.append(label)
                     logger.info(
                         "upload_documents: user=%s '%s' matches a demo/placeholder "
-                        "marker but %s — keeping it",
-                        user_id, label,
-                        "it contains real medical content" if has_medical_content(page)
-                        else "SKIP_DEMO_DOCUMENTS is off",
+                        "marker — keeping it and tagging it is_demo_document=true "
+                        "(medical content present: %s)",
+                        user_id, label, has_medical_content(page),
                     )
                 try:
                     assert_medical_document(page, label)
@@ -680,6 +674,9 @@ async def upload_documents(
         # some drug names could not be normalized. Each entry names the file,
         # the medications that cannot be cross-checked, and why.
         "language_degradations": language_degradations,
+        # Documents that matched a demo/placeholder marker. They were added
+        # normally — this names them so a caller can label or filter them.
+        "demo_documents": demo_documents,
         # Present (and non-empty) when a re-uploaded file was recognised and
         # not added a second time.
         "duplicate_files_skipped": duplicate_files_skipped,
